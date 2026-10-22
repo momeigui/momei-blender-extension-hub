@@ -1,9 +1,10 @@
 import { sendPrivateMessage } from "./feishu.js";
 import { TOKEN_PREFIX, tokenHash } from "./tokens.js";
+import { subscriptionStatus } from "./subscriptions.js";
 
 const STATE_KEY = "auth/notifications/release-state.json";
-const PAGE_SIZE = 8; // 兼顾 Worker 免费方案的每次调用子请求限额。
-const RETRY_PAGE_SIZE = 5;
+const PAGE_SIZE = 6; // 每位收件人增加一次订阅状态读取，控制单次调用量。
+const RETRY_PAGE_SIZE = 4;
 
 function validRelease(data) {
   if (!data || !/^\d+\.\d+\.\d+$/.test(data.version) || !Array.isArray(data.highlights)) return null;
@@ -37,6 +38,10 @@ function recipientKeys(version, userHash) {
 async function announceTo(env, release, recipient, tokenKey, isRetry = false) {
   const userHash = await tokenHash(`${env.FEISHU_APP_ID}:${recipient.feishuOpenId}`);
   const { sentKey, failureKey } = recipientKeys(release.version, userHash);
+  if (!await subscriptionStatus(env.EXTENSIONS, env.FEISHU_APP_ID, recipient.feishuOpenId)) {
+    if (isRetry) await env.EXTENSIONS.delete(failureKey);
+    return;
+  }
   if (await env.EXTENSIONS.head(sentKey)) {
     if (isRetry) await env.EXTENSIONS.delete(failureKey);
     return;

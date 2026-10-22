@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
+import { subscriptionStatus } from "../src/subscriptions.js";
 
 const origin = "https://updates.example.test";
 const env = {
@@ -175,6 +176,49 @@ test("文字申请也以飞书通讯录姓名和账号 ID 为准", async () => {
     const raw = [...configuredEnv.EXTENSIONS.items].find(([key]) => key.startsWith("auth/tokens/"))?.[1];
     assert.equal(JSON.parse(raw).applicantName, "真实姓名");
     assert.equal(JSON.parse(raw).feishuOpenId, "ou_employee12345");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("订阅菜单文字只改变本人状态；其它聊天内容不自动回复", async () => {
+  const configuredEnv = tokenEnv();
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    assert.equal(await subscriptionStatus(configuredEnv.EXTENSIONS, configuredEnv.FEISHU_APP_ID, "ou_employee12345"), true);
+    assert.deepEqual(await (await runEvent(messageEvent({ text: "你好" }), configuredEnv)).json(), { code: 0 });
+    assert.equal(sentTexts.length, 0);
+    assert.equal(configuredEnv.EXTENSIONS.items.size, 0);
+
+    await runEvent(messageEvent({ text: "取消更新提醒", eventId: "event_unsubscribe123" }), configuredEnv);
+    assert.equal(await subscriptionStatus(configuredEnv.EXTENSIONS, configuredEnv.FEISHU_APP_ID, "ou_employee12345"), false);
+    assert.match(sentTexts.at(-1), /已取消更新提醒/);
+    await runEvent(messageEvent({ text: "取消更新提醒", eventId: "event_unsubscribe123" }), configuredEnv);
+    assert.equal(sentTexts.length, 1);
+
+    await runEvent(messageEvent({ text: "订阅更新提醒", eventId: "event_subscribe123" }), configuredEnv);
+    assert.equal(await subscriptionStatus(configuredEnv.EXTENSIONS, configuredEnv.FEISHU_APP_ID, "ou_employee12345"), true);
+    assert.match(sentTexts.at(-1), /已订阅更新提醒/);
+    await runEvent(messageEvent({ text: "取消更新提醒", eventId: "event_unsubscribe123" }), configuredEnv);
+    assert.equal(await subscriptionStatus(configuredEnv.EXTENSIONS, configuredEnv.FEISHU_APP_ID, "ou_employee12345"), true);
+    assert.equal(sentTexts.length, 2);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 0);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("订阅事件 ID 菜单也能更新状态", async () => {
+  const configuredEnv = tokenEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => Response.json(String(url).includes("/oauth/") ? { code: 0, access_token: "access" } : { code: 0 });
+  try {
+    await runEvent(menuEvent({ eventKey: "unsubscribe_updates", eventId: "menu_unsubscribe123" }), configuredEnv);
+    assert.equal(await subscriptionStatus(configuredEnv.EXTENSIONS, configuredEnv.FEISHU_APP_ID, "ou_employee12345"), false);
+    await runEvent(menuEvent({ eventKey: "subscribe_updates", eventId: "menu_subscribe123" }), configuredEnv);
+    assert.equal(await subscriptionStatus(configuredEnv.EXTENSIONS, configuredEnv.FEISHU_APP_ID, "ou_employee12345"), true);
   } finally { globalThis.fetch = originalFetch; }
 });
 

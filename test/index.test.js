@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
+import { subscriptionKey } from "../src/subscriptions.js";
 
 class MemoryBucket {
   constructor() { this.items = new Map(); }
@@ -159,6 +160,21 @@ test("管理页面有会话、来源和 CSRF 防护", async () => {
   const logout = await send(env, "/admin/logout", postForm({ csrf: await csrf(env, cookie) }, cookie));
   assert.equal(logout.status, 303);
   assert.match(logout.headers.get("set-cookie"), /Max-Age=0/);
+});
+
+test("管理后台展示飞书令牌持有人的订阅状态，未操作默认已订阅", async () => {
+  const env = { ...fixture(), FEISHU_APP_ID: "cli_test" };
+  const openId = "ou_employee12345";
+  await env.EXTENSIONS.put(`auth/tokens/${"a".repeat(64)}.json`, JSON.stringify({
+    source: "feishu", label: "测试员工", feishuOpenId: openId,
+    expiresAt: new Date(Date.now() + 86400000).toISOString()
+  }));
+  const cookie = await login(env);
+  const before = await (await send(env, "/admin", { headers: { Cookie: cookie } })).text();
+  assert.match(before, /测试员工[\s\S]*已订阅/);
+  await env.EXTENSIONS.put(await subscriptionKey(env.FEISHU_APP_ID, openId), JSON.stringify({ subscribed: false }));
+  const after = await (await send(env, "/admin", { headers: { Cookie: cookie } })).text();
+  assert.match(after, /测试员工[\s\S]*已取消/);
 });
 
 test("正常浏览器未发送 Origin 时仍能登录和提交，跨站来源继续被拒绝", async () => {

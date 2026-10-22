@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
+import { subscriptionKey } from "../src/subscriptions.js";
 
 class MemoryBucket {
   constructor() { this.items = new Map(); this.versions = new Map(); }
@@ -79,11 +80,38 @@ test("大量员工分批通知，同版本成功发送者不重发", async () =>
   };
   try {
     await worker.scheduled({}, env);
-    assert.equal(messages.length, 8);
+    assert.equal(messages.length, 6);
     await worker.scheduled({}, env);
     assert.equal(messages.length, 10);
     await worker.scheduled({}, env);
     assert.equal(messages.length, 10);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("有效令牌默认订阅；取消后不发新版本，恢复后继续接收", async () => {
+  const env = setup();
+  const openId = "ou_employee00001";
+  env.EXTENSIONS.items.set(tokenKey(1), validToken(openId));
+  const key = await subscriptionKey(env.FEISHU_APP_ID, openId);
+  const messages = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    messages.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await worker.scheduled({}, env);
+    assert.equal(messages.length, 1);
+    env.EXTENSIONS.items.set(key, JSON.stringify({ subscribed: false }));
+    env.EXTENSIONS.items.set("latest.json", JSON.stringify({ version: "1.2.4", highlights: [] }));
+    await worker.scheduled({}, env);
+    assert.equal(messages.length, 1);
+    env.EXTENSIONS.items.set(key, JSON.stringify({ subscribed: true }));
+    env.EXTENSIONS.items.set("latest.json", JSON.stringify({ version: "1.2.5", highlights: [] }));
+    await worker.scheduled({}, env);
+    assert.equal(messages.length, 2);
+    assert.match(messages[1], /v1\.2\.5/);
   } finally { globalThis.fetch = originalFetch; }
 });
 
@@ -109,6 +137,27 @@ test("某个私聊暂时失败时仍通知其他人，并在下一轮重试失�
     assert.deepEqual(messages.map(item => item.receive_id), ["ou_employee00002", "ou_employee00001"]);
     await worker.scheduled({}, env);
     assert.equal(messages.length, 2);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("失败通知重试前若取消订阅，则不会再次发送", async () => {
+  const env = setup();
+  const openId = "ou_employee00001";
+  env.EXTENSIONS.items.set(tokenKey(1), validToken(openId));
+  let sends = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    sends++;
+    return Response.json({ code: 123 });
+  };
+  try {
+    await worker.scheduled({}, env);
+    assert.equal(sends, 1);
+    env.EXTENSIONS.items.set(await subscriptionKey(env.FEISHU_APP_ID, openId), JSON.stringify({ subscribed: false }));
+    await worker.scheduled({}, env);
+    assert.equal(sends, 1);
+    assert.equal([...env.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/notifications/failed/")).length, 0);
   } finally { globalThis.fetch = originalFetch; }
 });
 

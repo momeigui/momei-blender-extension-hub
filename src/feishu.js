@@ -1,4 +1,5 @@
 import { createDownloadToken, eventToken, tokenHash, TOKEN_PREFIX } from "./tokens.js";
+import { setSubscription } from "./subscriptions.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -92,15 +93,28 @@ async function employeeName(env, openId) {
   return name;
 }
 
-function requestName(message) {
+function messageText(message) {
   if (message?.message_type !== "text" || typeof message.content !== "string") return null;
-  let content;
-  try { content = JSON.parse(message.content).text?.trim(); } catch { return null; }
+  try {
+    const text = JSON.parse(message.content).text;
+    return typeof text === "string" ? text.trim() : null;
+  } catch { return null; }
+}
+
+function requestName(content) {
   if (typeof content !== "string") return null;
   const match = /^(?:领取令牌|申请令牌|令牌)\s+(.+)$/u.exec(content);
   if (!match) return null;
   const name = match[1].trim();
   return name.length >= 2 && name.length <= 40 && !/[\x00-\x1f<>]/u.test(name) ? name : null;
+}
+
+async function fulfillSubscriptionRequest(env, event, openId, subscribed) {
+  const changed = await setSubscription(env.EXTENSIONS, env.FEISHU_APP_ID, openId, subscribed, event.header.event_id);
+  if (changed) await sendPrivateMessage(env, openId, subscribed
+    ? "已订阅更新提醒。你持有有效更新令牌时，新版本发布后会收到私聊通知。"
+    : "已取消更新提醒。之后不会再收到版本更新私聊通知；下载令牌仍可正常使用。"
+  );
 }
 
 async function fulfillTokenRequest(env, event, name, openId, requestChannel = "message") {
@@ -297,19 +311,25 @@ export async function handleFeishuEvent(request, env, ctx) {
   }
   if (typeof envelope.encrypt !== "string") return json({ error: "unencrypted_event" }, 403);
   if (event.header?.app_id !== env.FEISHU_APP_ID) return json({ error: "wrong_app" }, 403);
-  // 只接管领令牌消息与指定菜单，其它现有订阅事件不得被静默确认。
+  // 只接管已定义的菜单和单聊命令；其它类型的事件仍交还给原有业务处理。
   if (event.header?.event_type === "application.bot.menu_v6") {
-    if (event.event?.event_key !== "request_update_token") return json({ error: "menu_not_handled" }, 503);
+    const menuAction = event.event?.event_key;
+    if (!["request_update_token", "subscribe_updates", "unsubscribe_updates"].includes(menuAction)) {
+      return json({ error: "menu_not_handled" }, 503);
+    }
     const openId = event.event?.operator?.operator_id?.open_id;
     if (typeof openId !== "string" || !/^ou_[A-Za-z0-9_-]{5,128}$/.test(openId) ||
         typeof event.header?.event_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(event.header.event_id)) {
       return json({ error: "invalid_menu_operator_or_event" }, 400);
     }
-    if (!env.FEISHU_APP_SECRET || !env.ADMIN_TOKEN || !env.EXTENSIONS || !ctx?.waitUntil) {
-      return json({ error: "token_issuance_not_configured" }, 503);
+    if (!env.FEISHU_APP_SECRET || !env.EXTENSIONS || !ctx?.waitUntil ||
+        (menuAction === "request_update_token" && !env.ADMIN_TOKEN)) {
+      return json({ error: "feishu_action_not_configured" }, 503);
     }
-    ctx.waitUntil(fulfillMenuRequest(env, event, openId)
-      .catch(error => console.error("Feishu menu token delivery failed", error.message)));
+    const task = menuAction === "request_update_token"
+      ? fulfillMenuRequest(env, event, openId)
+      : fulfillSubscriptionRequest(env, event, openId, menuAction === "subscribe_updates");
+    ctx.waitUntil(task.catch(error => console.error("Feishu menu action failed", error.message)));
     return json({ code: 0 });
   }
   if (event.header?.event_type !== "im.message.receive_v1") return json({ error: "event_not_handled" }, 503);
@@ -321,15 +341,18 @@ export async function handleFeishuEvent(request, env, ctx) {
       typeof event.header?.event_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(event.header.event_id)) {
     return json({ error: "invalid_sender_or_event" }, 400);
   }
-  if (!env.FEISHU_APP_SECRET || !env.ADMIN_TOKEN || !env.EXTENSIONS || !ctx?.waitUntil) {
-    return json({ error: "token_issuance_not_configured" }, 503);
+  const content = messageText(event.event.message);
+  const subscribed = content === "订阅更新提醒" ? true : content === "取消更新提醒" ? false : null;
+  const isTokenRequest = requestName(content) !== null;
+  // 菜单“发送文字消息”会走消息事件；其它聊天内容不自动回复。
+  if (subscribed === null && !isTokenRequest) return json({ code: 0 });
+  if (!env.FEISHU_APP_SECRET || !env.EXTENSIONS || !ctx?.waitUntil ||
+      (isTokenRequest && !env.ADMIN_TOKEN)) {
+    return json({ error: "feishu_action_not_configured" }, 503);
   }
-  if (!requestName(event.event.message)) {
-    ctx.waitUntil(sendPrivateMessage(env, openId, "领更新令牌请发送：领取令牌 你的姓名。令牌只会私聊发给你本人。")
-      .catch(error => console.error("Feishu instruction delivery failed", error.message)));
-    return json({ code: 0 });
-  }
-  ctx.waitUntil(fulfillMenuRequest(env, event, openId, "message")
-    .catch(error => console.error("Feishu token delivery failed", error.message)));
+  const task = subscribed === null
+    ? fulfillMenuRequest(env, event, openId, "message")
+    : fulfillSubscriptionRequest(env, event, openId, subscribed);
+  ctx.waitUntil(task.catch(error => console.error("Feishu message action failed", error.message)));
   return json({ code: 0 });
 }
