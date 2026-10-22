@@ -1,0 +1,186 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import worker from "../src/index.js";
+
+class MemoryBucket {
+  constructor() { this.items = new Map(); }
+
+  async put(key, value) {
+    const bytes = typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value);
+    this.items.set(key, { bytes, uploaded: new Date() });
+  }
+
+  async get(key) {
+    const item = this.items.get(key);
+    if (!item) return null;
+    return {
+      body: new Blob([item.bytes]).stream(),
+      size: item.bytes.length,
+      httpEtag: '"test-etag"',
+      json: async () => JSON.parse(new TextDecoder().decode(item.bytes))
+    };
+  }
+
+  async head(key) {
+    const item = this.items.get(key);
+    return item ? { size: item.bytes.length, httpEtag: '"test-etag"' } : null;
+  }
+
+  async delete(key) { this.items.delete(key); }
+
+  async list({ prefix = "", limit = 1000, cursor } = {}) {
+    const keys = [...this.items.keys()].filter(key => key.startsWith(prefix)).sort();
+    const start = cursor ? Number(cursor) : 0;
+    const slice = keys.slice(start, start + limit);
+    return {
+      objects: slice.map(key => ({ key, size: this.items.get(key).bytes.length, uploaded: this.items.get(key).uploaded })),
+      truncated: start + limit < keys.length,
+      cursor: start + limit < keys.length ? String(start + limit) : undefined
+    };
+  }
+}
+
+const origin = "https://updates.example.test";
+const zip = "Noetix-Motion-Editor-0.1.45-win64-cp313-pyd.zip";
+
+function fixture() {
+  return { EXTENSIONS: new MemoryBucket(), ADMIN_TOKEN: "administrator-long-random-secret" };
+}
+
+async function send(env, path, options = {}) {
+  return worker.fetch(new Request(`${origin}${path}`, options), env);
+}
+
+function postForm(fields, cookie = "") {
+  return {
+    method: "POST",
+    headers: {
+      Origin: origin,
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...(cookie ? { Cookie: cookie } : {})
+    },
+    body: new URLSearchParams(fields).toString()
+  };
+}
+
+async function login(env) {
+  const response = await send(env, "/admin/login", postForm({ secret: env.ADMIN_TOKEN }));
+  assert.equal(response.status, 303);
+  return response.headers.get("set-cookie").split(";")[0];
+}
+
+async function csrf(env, cookie) {
+  const html = await (await send(env, "/admin", { headers: { Cookie: cookie } })).text();
+  const match = html.match(/name="csrf" value="([a-f0-9]{64})"/);
+  assert.ok(match);
+  return match[1];
+}
+
+async function createToken(env, cookie) {
+  const response = await send(env, "/admin/tokens", postForm({ csrf: await csrf(env, cookie), label: "测试用户", days: "90" }, cookie));
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  const match = html.match(/nx_[A-Za-z0-9_-]{40,100}/);
+  assert.ok(match);
+  return match[0];
+}
+
+test("下载必须携带有效令牌，且只能访问索引和安装包", async () => {
+  const env = fixture();
+  const indexJson = JSON.stringify({ version: "v1", data: [{ archive_url: `./${zip}` }] });
+  await env.EXTENSIONS.put("index.json", indexJson);
+  await env.EXTENSIONS.put(zip, "ZIP_BYTES");
+  await env.EXTENSIONS.put("Other-Plugin-1.0.zip", "OTHER_ZIP");
+  const cookie = await login(env);
+  const token = await createToken(env, cookie);
+  assert.equal((await send(env, "/index.json")).status, 401);
+  assert.equal((await send(env, "/index.json", { headers: { Authorization: "Bearer wrong" } })).status, 401);
+  const auth = { Authorization: `Bearer ${token}` };
+  const index = await send(env, "/index.json", { headers: auth });
+  assert.equal(index.status, 200);
+  assert.equal(index.headers.get("content-type"), "application/json; charset=utf-8");
+  assert.equal(index.headers.get("cache-control"), "private, no-store");
+  assert.equal(await index.text(), indexJson);
+  const download = await send(env, `/${zip}`, { headers: auth });
+  assert.equal(await download.text(), "ZIP_BYTES");
+  const head = await send(env, `/${zip}`, { method: "HEAD", headers: auth });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get("content-length"), "9");
+  assert.equal(await head.text(), "");
+  assert.equal((await send(env, "/auth/tokens/secret.json", { headers: auth })).status, 404);
+  assert.equal((await send(env, "/other.zip", { headers: auth })).status, 404);
+  assert.equal((await send(env, "/Other-Plugin-1.0.zip", { headers: auth })).status, 404);
+  assert.equal((await send(env, "/index.json", { method: "POST", headers: auth })).status, 405);
+});
+
+test("新增插件只要写入索引即可下载，无需修改 Worker", async () => {
+  const env = fixture();
+  const otherZip = "Other-Plugin-1.0.zip";
+  await env.EXTENSIONS.put("index.json", JSON.stringify({ version: "v1", data: [{ archive_url: `./${otherZip}` }] }));
+  await env.EXTENSIONS.put(otherZip, "OTHER_ZIP");
+  const token = await createToken(env, await login(env));
+  const response = await send(env, `/${otherZip}`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "OTHER_ZIP");
+});
+
+test("网页只保存令牌摘要；撤销后立即拒绝下载", async () => {
+  const env = fixture();
+  await env.EXTENSIONS.put("index.json", "{}");
+  const cookie = await login(env);
+  const token = await createToken(env, cookie);
+  const keys = [...env.EXTENSIONS.items.keys()];
+  const tokenKey = keys.find(key => key.startsWith("auth/tokens/"));
+  assert.match(tokenKey, /^auth\/tokens\/[a-f0-9]{64}\.json$/);
+  assert.equal(JSON.stringify([...env.EXTENSIONS.items]).includes(token), false);
+  assert.equal((await send(env, "/index.json", { headers: { Authorization: `Bearer ${token}` } })).status, 200);
+  const hash = tokenKey.slice("auth/tokens/".length, -5);
+  const response = await send(env, "/admin/tokens/revoke", postForm({ csrf: await csrf(env, cookie), hash }, cookie));
+  assert.equal(response.status, 200);
+  assert.equal((await send(env, "/index.json", { headers: { Authorization: `Bearer ${token}` } })).status, 401);
+});
+
+test("管理页面有会话、来源和 CSRF 防护", async () => {
+  const env = fixture();
+  assert.equal((await send(env, "/admin/tokens", postForm({ label: "x", days: "90" }))).status, 401);
+  assert.equal((await send(env, "/admin/login", postForm({ secret: "wrong" }))).status, 401);
+  const cookie = await login(env);
+  assert.equal((await send(env, "/admin", { headers: { Cookie: cookie } })).status, 200);
+  const noCsrf = await send(env, "/admin/tokens", postForm({ label: "x", days: "90" }, cookie));
+  assert.equal(noCsrf.status, 403);
+  const badOrigin = await send(env, "/admin/tokens", {
+    ...postForm({ csrf: await csrf(env, cookie), label: "x", days: "90" }, cookie),
+    headers: { ...postForm({}, cookie).headers, Origin: "https://attacker.example" }
+  });
+  assert.equal(badOrigin.status, 403);
+  const logout = await send(env, "/admin/logout", postForm({ csrf: await csrf(env, cookie) }, cookie));
+  assert.equal(logout.status, 303);
+  assert.match(logout.headers.get("set-cookie"), /Max-Age=0/);
+});
+
+test("到期的令牌拒绝下载", async () => {
+  const env = fixture();
+  const token = "nx_" + "a".repeat(43);
+  const data = new TextEncoder().encode(token);
+  const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", data))]
+    .map(byte => byte.toString(16).padStart(2, "0")).join("");
+  await env.EXTENSIONS.put(`auth/tokens/${hash}.json`, JSON.stringify({ expiresAt: "2000-01-01T00:00:00Z" }));
+  await env.EXTENSIONS.put("index.json", "{}");
+  assert.equal((await send(env, "/index.json", { headers: { Authorization: `Bearer ${token}` } })).status, 401);
+});
+
+test("管理页转义用户备注，伪造会话无效", async () => {
+  const env = fixture();
+  const cookie = await login(env);
+  const htmlResponse = await send(env, "/admin/tokens", postForm({
+    csrf: await csrf(env, cookie), label: "<script>alert(1)</script>", days: "0"
+  }, cookie));
+  assert.equal(htmlResponse.status, 200);
+  const html = await htmlResponse.text();
+  assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+  assert.ok(!html.includes("<script>alert(1)</script>"));
+  const forged = cookie.replace(/.$/, cookie.endsWith("a") ? "b" : "a");
+  const response = await send(env, "/admin", { headers: { Cookie: forged } });
+  assert.ok((await response.text()).includes("管理员登录"));
+});
+
