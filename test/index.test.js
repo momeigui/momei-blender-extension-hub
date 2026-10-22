@@ -146,6 +146,9 @@ test("管理页面有会话、来源和 CSRF 防护", async () => {
   assert.equal((await send(env, "/admin/login", postForm({ secret: "wrong" }))).status, 401);
   const cookie = await login(env);
   assert.equal((await send(env, "/admin", { headers: { Cookie: cookie } })).status, 200);
+  const dashboardHtml = await (await send(env, "/admin", { headers: { Cookie: cookie } })).text();
+  assert.ok(dashboardHtml.includes('class="data-table token-table"'));
+  assert.ok(dashboardHtml.includes('.token-table{min-width:790px}'));
   const noCsrf = await send(env, "/admin/tokens", postForm({ label: "x", days: "90" }, cookie));
   assert.equal(noCsrf.status, 403);
   const badOrigin = await send(env, "/admin/tokens", {

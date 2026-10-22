@@ -99,6 +99,14 @@ function messageEvent({ eventId = "event_12345678", chatType = "p2p", text = "�
   };
 }
 
+function menuEvent({ eventId = "menu_event_12345678", eventKey = "request_update_token" } = {}) {
+  return {
+    schema: "2.0",
+    header: { token: env.FEISHU_VERIFY_TOKEN, app_id: env.FEISHU_APP_ID, tenant_key: "tenant_test", event_id: eventId, event_type: "application.bot.menu_v6" },
+    event: { event_key: eventKey, operator: { operator_id: { open_id: "ou_employee12345" } } }
+  };
+}
+
 function tokenEnv() {
   return { ...env, ADMIN_TOKEN: "admin-secret-for-token-derivation", FEISHU_APP_SECRET: "feishu-app-secret", EXTENSIONS: new MemoryBucket() };
 }
@@ -159,6 +167,56 @@ test("飞书事件重试复用同一令牌；发送失败不留下未交付的�
     globalThis.fetch = async url => Response.json(String(url).includes("/oauth/") ? { code: 0, access_token: "access" } : { code: 123 });
     await runEvent(messageEvent({ eventId: "event_87654321" }), configuredEnv);
     assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("点击指定菜单：用飞书账号查询真实姓名并只私聊发放", async () => {
+  const configuredEnv = tokenEnv();
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "邓志美", status: { is_activated: true } } } });
+    return Response.json({ code: 0 });
+  };
+  try {
+    assert.deepEqual(await (await runEvent(menuEvent(), configuredEnv)).json(), { code: 0 });
+    const [[key, rawRecord]] = [...configuredEnv.EXTENSIONS.items];
+    const record = JSON.parse(rawRecord);
+    assert.match(key, /^auth\/tokens\/[a-f0-9]{64}\.json$/);
+    assert.equal(record.applicantName, "邓志美");
+    assert.equal(record.feishuOpenId, "ou_employee12345");
+    assert.equal(record.requestChannel, "menu");
+    assert.ok(Date.parse(record.requestedAt));
+    assert.ok(calls.some(call => call.url.includes("/contact/v3/users/ou_employee12345?user_id_type=open_id")));
+    const sent = calls.find(call => call.url.includes("/im/v1/messages"));
+    assert.equal(JSON.parse(sent.options.body).receive_id, "ou_employee12345");
+    assert.match(JSON.parse(JSON.parse(sent.options.body).content).text, /nx_[A-Za-z0-9_-]{40,100}/);
+    assert.equal((await worker.fetch(await signedEvent(menuEvent({ eventKey: "other_menu" })), configuredEnv)).status, 503);
+    assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("通讯录权限不足时不发令牌，并向申请者说明原因", async () => {
+  const configuredEnv = tokenEnv();
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 99991672 });
+    sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await runEvent(menuEvent(), configuredEnv);
+    assert.equal(configuredEnv.EXTENSIONS.items.size, 0);
+    assert.match(sentTexts[0], /获取用户基本信息/);
+    assert.ok(!sentTexts[0].includes("nx_"));
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -74,6 +74,22 @@ async function sendPrivateMessage(env, openId, text) {
   if (!response.ok || result.code !== 0) throw new Error(`feishu_message_${result.code ?? response.status}`);
 }
 
+async function employeeName(env, openId) {
+  const accessToken = await feishuAccessToken(env);
+  const response = await fetch(`https://open.feishu.cn/open-apis/contact/v3/users/${encodeURIComponent(openId)}?user_id_type=open_id`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const result = await response.json();
+  if (!response.ok || result.code !== 0) throw new Error(`feishu_contact_${result.code ?? response.status}`);
+  const rawName = result.data?.user?.name;
+  const name = typeof rawName === "string" ? rawName.trim() : "";
+  if (!name || name.length > 80) throw new Error("feishu_contact_name_missing");
+  if (result.data?.user?.status?.is_resigned === true || result.data?.user?.status?.is_activated === false) {
+    throw new Error("feishu_contact_inactive_user");
+  }
+  return name;
+}
+
 function requestName(message) {
   if (message?.message_type !== "text" || typeof message.content !== "string") return null;
   let content;
@@ -85,8 +101,7 @@ function requestName(message) {
   return name.length >= 2 && name.length <= 40 && !/[\x00-\x1f<>]/u.test(name) ? name : null;
 }
 
-async function fulfillTokenRequest(env, event, name) {
-  const openId = event.event.sender.sender_id.open_id;
+async function fulfillTokenRequest(env, event, name, openId, requestChannel = "message") {
   const eventId = event.header.event_id;
   const token = await eventToken(env.ADMIN_TOKEN, env.FEISHU_APP_ID, eventId);
   const hash = await tokenHash(token);
@@ -103,6 +118,7 @@ async function fulfillTokenRequest(env, event, name) {
         feishuOpenId: openId,
         feishuTenantKey: event.header.tenant_key || null,
         feishuEventId: eventId,
+        requestChannel,
         requestedAt: new Date().toISOString()
       }
     });
@@ -113,6 +129,18 @@ async function fulfillTokenRequest(env, event, name) {
     if (!existing) await env.EXTENSIONS.delete(key);
     throw error;
   }
+}
+
+async function fulfillMenuRequest(env, event, openId) {
+  let name;
+  try {
+    name = await employeeName(env, openId);
+  } catch (error) {
+    console.error("Feishu employee lookup failed", error.message);
+    await sendPrivateMessage(env, openId, "暂时无法从企业通讯录读取你的姓名，未创建令牌。请联系管理员检查应用的“获取用户基本信息”权限和通讯录可用范围。");
+    return;
+  }
+  await fulfillTokenRequest(env, event, name, openId, "menu");
 }
 
 export async function handleFeishuEvent(request, env, ctx) {
@@ -156,7 +184,21 @@ export async function handleFeishuEvent(request, env, ctx) {
   }
   if (typeof envelope.encrypt !== "string") return json({ error: "unencrypted_event" }, 403);
   if (event.header?.app_id !== env.FEISHU_APP_ID) return json({ error: "wrong_app" }, 403);
-  // 此阶段只接管员工单聊里的领令牌命令；其它现有订阅事件不得被静默确认。
+  // 只接管领令牌消息与指定菜单，其它现有订阅事件不得被静默确认。
+  if (event.header?.event_type === "application.bot.menu_v6") {
+    if (event.event?.event_key !== "request_update_token") return json({ error: "menu_not_handled" }, 503);
+    const openId = event.event?.operator?.operator_id?.open_id;
+    if (typeof openId !== "string" || !/^ou_[A-Za-z0-9_-]{5,128}$/.test(openId) ||
+        typeof event.header?.event_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(event.header.event_id)) {
+      return json({ error: "invalid_menu_operator_or_event" }, 400);
+    }
+    if (!env.FEISHU_APP_SECRET || !env.ADMIN_TOKEN || !env.EXTENSIONS || !ctx?.waitUntil) {
+      return json({ error: "token_issuance_not_configured" }, 503);
+    }
+    ctx.waitUntil(fulfillMenuRequest(env, event, openId)
+      .catch(error => console.error("Feishu menu token delivery failed", error.message)));
+    return json({ code: 0 });
+  }
   if (event.header?.event_type !== "im.message.receive_v1") return json({ error: "event_not_handled" }, 503);
   if (event.event?.message?.chat_type !== "p2p" || event.event?.sender?.sender_type !== "user") {
     return json({ error: "private_user_message_required" }, 403);
@@ -175,7 +217,7 @@ export async function handleFeishuEvent(request, env, ctx) {
       .catch(error => console.error("Feishu instruction delivery failed", error.message)));
     return json({ code: 0 });
   }
-  ctx.waitUntil(fulfillTokenRequest(env, event, name)
+  ctx.waitUntil(fulfillTokenRequest(env, event, name, openId)
     .catch(error => console.error("Feishu token delivery failed", error.message)));
   return json({ code: 0 });
 }
