@@ -1,5 +1,6 @@
 import { escapeHtml, securityHeaders, page, homePage } from "./site.js";
 import { handleFeishuEvent } from "./feishu.js";
+import { notifyLatestRelease } from "./notifications.js";
 import { TOKEN_PREFIX, randomBase64Url, tokenHash, createDownloadToken } from "./tokens.js";
 
 const COOKIE_NAME = "momei_extensions_admin";
@@ -244,6 +245,9 @@ async function handleDownload(request, env, path) {
 }
 
 export default {
+  async scheduled(_controller, env) {
+    await notifyLatestRelease(env);
+  },
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     try {

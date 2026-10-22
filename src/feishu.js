@@ -5,7 +5,7 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_CLOCK_SKEW_SECONDS = 300;
 const USER_PREFIX = "auth/feishu-users/";
-const CLAIM_TIMEOUT_MS = 10 * 60 * 1000;
+const PENDING_TIMEOUT_MS = 60 * 1000;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -65,12 +65,12 @@ async function feishuAccessToken(env) {
   return result.access_token;
 }
 
-async function sendPrivateMessage(env, openId, text) {
+export async function sendPrivateMessage(env, openId, text, uuid = undefined) {
   const accessToken = await feishuAccessToken(env);
   const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id", {
     method: "POST",
     headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ receive_id: openId, msg_type: "text", content: JSON.stringify({ text }) })
+    body: JSON.stringify({ receive_id: openId, msg_type: "text", content: JSON.stringify({ text }), ...(uuid ? { uuid } : {}) })
   });
   const result = await response.json();
   if (!response.ok || result.code !== 0) throw new Error(`feishu_message_${result.code ?? response.status}`);
@@ -119,7 +119,7 @@ async function fulfillTokenRequest(env, event, name, openId, requestChannel = "m
     if (oldToken) {
       const adopted = await env.EXTENSIONS.put(userKey, JSON.stringify({
         status: "issued", tokenHash: oldToken.hash, eventId: oldToken.feishuEventId || null,
-        createdAt: oldToken.requestedAt || oldToken.createdAt
+        createdAt: oldToken.requestedAt || oldToken.createdAt, applicantName: oldToken.applicantName || name
       }), { onlyIf: new Headers({ "If-None-Match": "*" }), httpMetadata: { contentType: "application/json" } });
       if (adopted) {
         await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
@@ -147,17 +147,13 @@ async function fulfillTokenRequest(env, event, name, openId, requestChannel = "m
       await env.EXTENSIONS.put(userKey, JSON.stringify({
         status: "issued", tokenHash: anotherToken.hash,
         eventId: anotherToken.feishuEventId || null,
-        createdAt: anotherToken.requestedAt || anotherToken.createdAt
+        createdAt: anotherToken.requestedAt || anotherToken.createdAt, applicantName: anotherToken.applicantName || name
       }), { onlyIf: { etagMatches: marker.etag }, httpMetadata: { contentType: "application/json" } });
       await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
       return;
     }
-    if (now - Date.parse(state.createdAt) < CLAIM_TIMEOUT_MS) {
-      await sendPrivateMessage(env, openId, "近期已经申请过令牌，请稍后再试；如需立即更换，请联系管理员。");
-      return;
-    }
   }
-  if (state?.status === "pending" && now - Date.parse(state.createdAt) < CLAIM_TIMEOUT_MS) {
+  if (state?.status === "pending" && now - Date.parse(state.createdAt) < PENDING_TIMEOUT_MS) {
     // 上一次请求仍在处理；重试事件也不并发创建令牌。
     if (state.eventId !== eventId) {
       await sendPrivateMessage(env, openId, "你的令牌申请正在处理，请勿重复点击。若稍后未收到令牌，请联系管理员。");
@@ -171,14 +167,14 @@ async function fulfillTokenRequest(env, event, name, openId, requestChannel = "m
       await env.EXTENSIONS.put(userKey, JSON.stringify({
         status: "issued", tokenHash: orphanedToken.hash,
         eventId: orphanedToken.feishuEventId || null,
-        createdAt: orphanedToken.requestedAt || orphanedToken.createdAt
+        createdAt: orphanedToken.requestedAt || orphanedToken.createdAt, applicantName: orphanedToken.applicantName || name
       }), { onlyIf: { etagMatches: marker.etag }, httpMetadata: { contentType: "application/json" } });
       await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
       return;
     }
   }
 
-  const claim = { status: "pending", eventId, tokenHash: hash, createdAt: new Date(now).toISOString() };
+  const claim = { status: "pending", eventId, tokenHash: hash, createdAt: new Date(now).toISOString(), applicantName: name };
   const claimed = await env.EXTENSIONS.put(userKey, JSON.stringify(claim), {
     onlyIf: marker ? { etagMatches: marker.etag } : new Headers({ "If-None-Match": "*" }),
     httpMetadata: { contentType: "application/json" }
@@ -248,7 +244,7 @@ async function deliverToken(env, openId, name, token) {
   await sendPrivateMessage(env, openId, `你好，${name}。你的 Blender 更新令牌（有效期 90 天）是：\n${token}\n\n在 Blender 扩展仓库设置中填写 https://blender.3ddd.site/index.json，勾选“需要访问令牌”并粘贴此令牌。请勿转发或截图。`);
 }
 
-async function fulfillMenuRequest(env, event, openId) {
+async function fulfillMenuRequest(env, event, openId, requestChannel = "menu") {
   let name;
   try {
     name = await employeeName(env, openId);
@@ -257,7 +253,7 @@ async function fulfillMenuRequest(env, event, openId) {
     await sendPrivateMessage(env, openId, "暂时无法从企业通讯录读取你的姓名，未创建令牌。请联系管理员检查应用的“获取用户基本信息”权限和通讯录可用范围。");
     return;
   }
-  await fulfillTokenRequest(env, event, name, openId, "menu");
+  await fulfillTokenRequest(env, event, name, openId, requestChannel);
 }
 
 export async function handleFeishuEvent(request, env, ctx) {
@@ -328,13 +324,12 @@ export async function handleFeishuEvent(request, env, ctx) {
   if (!env.FEISHU_APP_SECRET || !env.ADMIN_TOKEN || !env.EXTENSIONS || !ctx?.waitUntil) {
     return json({ error: "token_issuance_not_configured" }, 503);
   }
-  const name = requestName(event.event.message);
-  if (!name) {
+  if (!requestName(event.event.message)) {
     ctx.waitUntil(sendPrivateMessage(env, openId, "领更新令牌请发送：领取令牌 你的姓名。令牌只会私聊发给你本人。")
       .catch(error => console.error("Feishu instruction delivery failed", error.message)));
     return json({ code: 0 });
   }
-  ctx.waitUntil(fulfillTokenRequest(env, event, name, openId)
+  ctx.waitUntil(fulfillMenuRequest(env, event, openId, "message")
     .catch(error => console.error("Feishu token delivery failed", error.message)));
   return json({ code: 0 });
 }

@@ -3,6 +3,9 @@
   "name": "momei-blender-extension-hub",
   "main": "src/index.js",
   "compatibility_date": "2026-10-22",
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "r2_buckets": [
     {
       "binding": "EXTENSIONS",

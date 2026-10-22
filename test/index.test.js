@@ -222,6 +222,9 @@ test("公开首页展示产品介绍和 R2 中最新版本说明，不暴露后�
   assert.ok(html.includes("v0.1.45"));
   assert.ok(html.includes("锁脚与锁手平滑过渡"));
   assert.ok(html.includes("/index.json"));
+  assert.ok(html.includes("https://blender.3ddd.site/index.json"));
+  assert.ok(!html.includes("momei-blender-extension-hub.amor.workers.dev"));
+  assert.ok(!html.includes('href="/admin"'));
   assert.ok(!html.includes(env.ADMIN_TOKEN));
   assert.ok(!html.includes("auth/tokens"));
   assert.equal(response.headers.get("x-frame-options"), "DENY");

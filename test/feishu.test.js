@@ -133,8 +133,10 @@ test("员工私聊领令牌：记录申请人、飞书身份及申请时间，�
   const calls = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
-    calls.push({ url: String(url), body: JSON.parse(options.body) });
-    return Response.json(url.includes("/oauth/") ? { code: 0, access_token: "feishu-access-token" } : { code: 0 });
+    calls.push({ url: String(url), body: options?.body ? JSON.parse(options.body) : null });
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "feishu-access-token" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "张三" } } });
+    return Response.json({ code: 0 });
   };
   try {
     const response = await runEvent(messageEvent(), configuredEnv);
@@ -160,12 +162,29 @@ test("员工私聊领令牌：记录申请人、飞书身份及申请时间，�
   }
 });
 
+test("文字申请也以飞书通讯录姓名和账号 ID 为准", async () => {
+  const configuredEnv = tokenEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "真实姓名" } } });
+    return Response.json({ code: 0 });
+  };
+  try {
+    await runEvent(messageEvent({ text: "领取令牌 随便填" }), configuredEnv);
+    const raw = [...configuredEnv.EXTENSIONS.items].find(([key]) => key.startsWith("auth/tokens/"))?.[1];
+    assert.equal(JSON.parse(raw).applicantName, "真实姓名");
+    assert.equal(JSON.parse(raw).feishuOpenId, "ou_employee12345");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("飞书事件重试复用同一令牌；发送失败不留下未交付的新令牌", async () => {
   const configuredEnv = tokenEnv();
   const issued = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "张三" } } });
     issued.push(JSON.parse(JSON.parse(options.body).content).text.match(/nx_[A-Za-z0-9_-]+/)?.[0]);
     return Response.json({ code: 0 });
   };
@@ -174,7 +193,8 @@ test("飞书事件重试复用同一令牌；发送失败不留下未交付的�
     await runEvent(messageEvent(), configuredEnv);
     assert.equal(issued[0], issued[1]);
     assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
-    globalThis.fetch = async url => Response.json(String(url).includes("/oauth/") ? { code: 0, access_token: "access" } : { code: 123 });
+    globalThis.fetch = async url => Response.json(String(url).includes("/oauth/") ? { code: 0, access_token: "access" } :
+      String(url).includes("/contact/v3/users/") ? { code: 0, data: { user: { name: "张三" } } } : { code: 123 });
     await runEvent(messageEvent({ eventId: "event_87654321" }), configuredEnv);
     assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
   } finally {
@@ -258,6 +278,7 @@ test("并发申请只有一个请求能占用飞书账号", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
     if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "张三" } } });
     sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
     return Response.json({ code: 0 });
   };
@@ -281,6 +302,7 @@ test("已有旧版飞书令牌的账号不会额外领取新令牌", async () =>
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
     if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "张三" } } });
     sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
     return Response.json({ code: 0 });
   };
@@ -291,12 +313,13 @@ test("已有旧版飞书令牌的账号不会额外领取新令牌", async () =>
   } finally { globalThis.fetch = originalFetch; }
 });
 
-test("撤销后十分钟内不可连续再申请；旧版多枚令牌也不会绕过限额", async () => {
+test("撤销后可立即重新申请；旧版多枚令牌仍计入限额", async () => {
   const configuredEnv = tokenEnv();
   const sentTexts = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
     if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "张三" } } });
     sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
     return Response.json({ code: 0 });
   };
@@ -305,15 +328,15 @@ test("撤销后十分钟内不可连续再申请；旧版多枚令牌也不会�
     const firstToken = [...configuredEnv.EXTENSIONS.items.keys()].find(key => key.startsWith("auth/tokens/"));
     await configuredEnv.EXTENSIONS.delete(firstToken);
     await runEvent(messageEvent({ eventId: "event_again123" }), configuredEnv);
-    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 0);
-    assert.match(sentTexts.at(-1), /稍后再试/);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
+    assert.match(sentTexts.at(-1), /nx_/);
 
     configuredEnv.EXTENSIONS.items.set(`auth/tokens/${"b".repeat(64)}.json`, JSON.stringify({
       source: "feishu", feishuOpenId: "ou_employee12345", applicantName: "张三",
       createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString()
     }));
     await runEvent(messageEvent({ eventId: "event_third123" }), configuredEnv);
-    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 2);
     assert.match(sentTexts.at(-1), /不能重复申请/);
   } finally { globalThis.fetch = originalFetch; }
 });
