@@ -80,7 +80,16 @@ async function csrfToken(secret, payload) {
 }
 
 function sameOrigin(request) {
-  return request.headers.get("Origin") === new URL(request.url).origin;
+  const expected = new URL(request.url).origin;
+  const origin = request.headers.get("Origin");
+  if (origin && origin !== "null") return origin === expected;
+  const referer = request.headers.get("Referer");
+  if (!referer) return null;
+  try {
+    return new URL(referer).origin === expected;
+  } catch {
+    return false;
+  }
 }
 
 async function formFields(request) {
@@ -146,7 +155,8 @@ async function dashboard(env, payload, notice = "", createdToken = "") {
 
 async function handleAdmin(request, env, path) {
   if (!env.ADMIN_TOKEN || !env.EXTENSIONS) return new Response("管理服务未配置", { status: 503 });
-  if (request.method === "POST" && !sameOrigin(request)) return new Response("来源校验失败", { status: 403, headers: securityHeaders() });
+  // 明确跨站的请求仍拒绝；Origin/Referer 都缺失时，登录密钥或下方 CSRF 校验负责认证。
+  if (request.method === "POST" && sameOrigin(request) === false) return new Response("来源校验失败", { status: 403, headers: securityHeaders() });
   if (path === "/admin/login" && request.method === "POST") {
     const form = await formFields(request);
     const supplied = form?.get("secret") || "";
@@ -248,4 +258,6 @@ export default {
     }
   }
 };
+
+
 
