@@ -79,13 +79,23 @@ test("未配置密钥或令牌下发条件不足时明确拒绝", async () => {
 });
 
 class MemoryBucket {
-  constructor() { this.items = new Map(); }
+  constructor() { this.items = new Map(); this.versions = new Map(); }
   async get(key) {
     const value = this.items.get(key);
-    return value ? { json: async () => JSON.parse(value) } : null;
+    return value ? { etag: String(this.versions.get(key)), json: async () => JSON.parse(value) } : null;
   }
-  async put(key, value) { this.items.set(key, value); }
-  async delete(key) { this.items.delete(key); }
+  async put(key, value, options = {}) {
+    if (options.onlyIf instanceof Headers && options.onlyIf.get("If-None-Match") === "*" && this.items.has(key)) return null;
+    if (options.onlyIf?.etagMatches && String(this.versions.get(key)) !== options.onlyIf.etagMatches) return null;
+    const version = (this.versions.get(key) || 0) + 1;
+    this.items.set(key, value);
+    this.versions.set(key, version);
+    return { etag: String(version) };
+  }
+  async list({ prefix = "" } = {}) {
+    return { objects: [...this.items.keys()].filter(key => key.startsWith(prefix)).map(key => ({ key })), truncated: false };
+  }
+  async delete(key) { this.items.delete(key); this.versions.delete(key); }
 }
 
 function messageEvent({ eventId = "event_12345678", chatType = "p2p", text = "领取令牌 张三", senderType = "user" } = {}) {
@@ -130,7 +140,7 @@ test("员工私聊领令牌：记录申请人、飞书身份及申请时间，�
     const response = await runEvent(messageEvent(), configuredEnv);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { code: 0 });
-    const [[key, rawRecord]] = [...configuredEnv.EXTENSIONS.items];
+    const [key, rawRecord] = [...configuredEnv.EXTENSIONS.items].find(([itemKey]) => itemKey.startsWith("auth/tokens/"));
     assert.match(key, /^auth\/tokens\/[a-f0-9]{64}\.json$/);
     const record = JSON.parse(rawRecord);
     assert.equal(record.label, "张三");
@@ -163,10 +173,10 @@ test("飞书事件重试复用同一令牌；发送失败不留下未交付的�
     await runEvent(messageEvent(), configuredEnv);
     await runEvent(messageEvent(), configuredEnv);
     assert.equal(issued[0], issued[1]);
-    assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
     globalThis.fetch = async url => Response.json(String(url).includes("/oauth/") ? { code: 0, access_token: "access" } : { code: 123 });
     await runEvent(messageEvent({ eventId: "event_87654321" }), configuredEnv);
-    assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -184,7 +194,7 @@ test("点击指定菜单：用飞书账号查询真实姓名并只私聊发放",
   };
   try {
     assert.deepEqual(await (await runEvent(menuEvent(), configuredEnv)).json(), { code: 0 });
-    const [[key, rawRecord]] = [...configuredEnv.EXTENSIONS.items];
+    const [key, rawRecord] = [...configuredEnv.EXTENSIONS.items].find(([itemKey]) => itemKey.startsWith("auth/tokens/"));
     const record = JSON.parse(rawRecord);
     assert.match(key, /^auth\/tokens\/[a-f0-9]{64}\.json$/);
     assert.equal(record.applicantName, "邓志美");
@@ -196,7 +206,7 @@ test("点击指定菜单：用飞书账号查询真实姓名并只私聊发放",
     assert.equal(JSON.parse(sent.options.body).receive_id, "ou_employee12345");
     assert.match(JSON.parse(JSON.parse(sent.options.body).content).text, /nx_[A-Za-z0-9_-]{40,100}/);
     assert.equal((await worker.fetch(await signedEvent(menuEvent({ eventKey: "other_menu" })), configuredEnv)).status, 503);
-    assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -220,4 +230,90 @@ test("通讯录权限不足时不发令牌，并向申请者说明原因", async
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("同一飞书账号重复点击或发送消息，只保留一个有效令牌", async () => {
+  const configuredEnv = tokenEnv();
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    if (String(url).includes("/contact/v3/users/")) return Response.json({ code: 0, data: { user: { name: "张三" } } });
+    sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await runEvent(messageEvent(), configuredEnv);
+    await runEvent(menuEvent(), configuredEnv);
+    await runEvent(messageEvent({ eventId: "event_second123" }), configuredEnv);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
+    assert.equal(sentTexts.filter(text => text.includes("nx_")).length, 1);
+    assert.equal(sentTexts.filter(text => text.includes("不能重复申请")).length, 2);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("并发申请只有一个请求能占用飞书账号", async () => {
+  const configuredEnv = tokenEnv();
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await Promise.all([
+      runEvent(messageEvent({ eventId: "event_parallel1" }), configuredEnv),
+      runEvent(messageEvent({ eventId: "event_parallel2" }), configuredEnv)
+    ]);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
+    assert.equal(sentTexts.filter(text => text.includes("nx_")).length, 1);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("已有旧版飞书令牌的账号不会额外领取新令牌", async () => {
+  const configuredEnv = tokenEnv();
+  configuredEnv.EXTENSIONS.items.set(`auth/tokens/${"a".repeat(64)}.json`, JSON.stringify({
+    source: "feishu", feishuOpenId: "ou_employee12345", applicantName: "张三",
+    createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString()
+  }));
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await runEvent(messageEvent(), configuredEnv);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
+    assert.match(sentTexts[0], /不能重复申请/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("撤销后十分钟内不可连续再申请；旧版多枚令牌也不会绕过限额", async () => {
+  const configuredEnv = tokenEnv();
+  const sentTexts = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    sentTexts.push(JSON.parse(JSON.parse(options.body).content).text);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await runEvent(messageEvent(), configuredEnv);
+    const firstToken = [...configuredEnv.EXTENSIONS.items.keys()].find(key => key.startsWith("auth/tokens/"));
+    await configuredEnv.EXTENSIONS.delete(firstToken);
+    await runEvent(messageEvent({ eventId: "event_again123" }), configuredEnv);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 0);
+    assert.match(sentTexts.at(-1), /稍后再试/);
+
+    configuredEnv.EXTENSIONS.items.set(`auth/tokens/${"b".repeat(64)}.json`, JSON.stringify({
+      source: "feishu", feishuOpenId: "ou_employee12345", applicantName: "张三",
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString()
+    }));
+    await runEvent(messageEvent({ eventId: "event_third123" }), configuredEnv);
+    assert.equal([...configuredEnv.EXTENSIONS.items.keys()].filter(key => key.startsWith("auth/tokens/")).length, 1);
+    assert.match(sentTexts.at(-1), /不能重复申请/);
+  } finally { globalThis.fetch = originalFetch; }
 });

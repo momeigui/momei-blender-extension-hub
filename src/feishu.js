@@ -4,6 +4,8 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_CLOCK_SKEW_SECONDS = 300;
+const USER_PREFIX = "auth/feishu-users/";
+const CLAIM_TIMEOUT_MS = 10 * 60 * 1000;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -106,29 +108,144 @@ async function fulfillTokenRequest(env, event, name, openId, requestChannel = "m
   const token = await eventToken(env.ADMIN_TOKEN, env.FEISHU_APP_ID, eventId);
   const hash = await tokenHash(token);
   const key = `${TOKEN_PREFIX}${hash}.json`;
-  const existing = await env.EXTENSIONS.get(key);
-  if (!existing) {
-    await createDownloadToken(env.EXTENSIONS, {
-      label: name,
-      days: 90,
-      token,
-      metadata: {
-        source: "feishu",
-        applicantName: name,
-        feishuOpenId: openId,
-        feishuTenantKey: event.header.tenant_key || null,
-        feishuEventId: eventId,
-        requestChannel,
-        requestedAt: new Date().toISOString()
+  const userKey = `${USER_PREFIX}${await sha256Hex(`${env.FEISHU_APP_ID}:${openId}`)}.json`;
+  let marker = await env.EXTENSIONS.get(userKey);
+  let state = marker ? await marker.json() : null;
+  const now = Date.now();
+
+  // 兼容上线前发出的令牌：不撤销旧令牌，但阻止同一账号继续领取。
+  if (!marker) {
+    const oldToken = await findActiveFeishuToken(env.EXTENSIONS, openId);
+    if (oldToken) {
+      const adopted = await env.EXTENSIONS.put(userKey, JSON.stringify({
+        status: "issued", tokenHash: oldToken.hash, eventId: oldToken.feishuEventId || null,
+        createdAt: oldToken.requestedAt || oldToken.createdAt
+      }), { onlyIf: new Headers({ "If-None-Match": "*" }), httpMetadata: { contentType: "application/json" } });
+      if (adopted) {
+        await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
+        return;
       }
-    });
+      marker = await env.EXTENSIONS.get(userKey);
+      state = marker ? await marker.json() : null;
+    }
+  }
+
+  if (state?.status === "issued") {
+    const active = state.tokenHash && await activeTokenRecord(env.EXTENSIONS, state.tokenHash);
+    if (active) {
+      // 飞书重试同一事件时可以重发同一令牌，不创建第二枚。
+      if (state.eventId === eventId && state.tokenHash === hash) {
+        await deliverToken(env, openId, name, token);
+      } else {
+        await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
+      }
+      return;
+    }
+    // 旧版本可能曾给同一人发过不止一枚；撤销其中一枚不应放行新的申请。
+    const anotherToken = await findActiveFeishuToken(env.EXTENSIONS, openId);
+    if (anotherToken) {
+      await env.EXTENSIONS.put(userKey, JSON.stringify({
+        status: "issued", tokenHash: anotherToken.hash,
+        eventId: anotherToken.feishuEventId || null,
+        createdAt: anotherToken.requestedAt || anotherToken.createdAt
+      }), { onlyIf: { etagMatches: marker.etag }, httpMetadata: { contentType: "application/json" } });
+      await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
+      return;
+    }
+    if (now - Date.parse(state.createdAt) < CLAIM_TIMEOUT_MS) {
+      await sendPrivateMessage(env, openId, "近期已经申请过令牌，请稍后再试；如需立即更换，请联系管理员。");
+      return;
+    }
+  }
+  if (state?.status === "pending" && now - Date.parse(state.createdAt) < CLAIM_TIMEOUT_MS) {
+    // 上一次请求仍在处理；重试事件也不并发创建令牌。
+    if (state.eventId !== eventId) {
+      await sendPrivateMessage(env, openId, "你的令牌申请正在处理，请勿重复点击。若稍后未收到令牌，请联系管理员。");
+    }
+    return;
+  }
+
+  if (state?.status === "pending") {
+    const orphanedToken = await findActiveFeishuToken(env.EXTENSIONS, openId);
+    if (orphanedToken) {
+      await env.EXTENSIONS.put(userKey, JSON.stringify({
+        status: "issued", tokenHash: orphanedToken.hash,
+        eventId: orphanedToken.feishuEventId || null,
+        createdAt: orphanedToken.requestedAt || orphanedToken.createdAt
+      }), { onlyIf: { etagMatches: marker.etag }, httpMetadata: { contentType: "application/json" } });
+      await sendPrivateMessage(env, openId, "你已经有有效的 Blender 更新令牌，不能重复申请。若令牌遗失，请联系管理员撤销旧令牌后再申请。");
+      return;
+    }
+  }
+
+  const claim = { status: "pending", eventId, tokenHash: hash, createdAt: new Date(now).toISOString() };
+  const claimed = await env.EXTENSIONS.put(userKey, JSON.stringify(claim), {
+    onlyIf: marker ? { etagMatches: marker.etag } : new Headers({ "If-None-Match": "*" }),
+    httpMetadata: { contentType: "application/json" }
+  });
+  if (!claimed) {
+    // 并发请求中只有一个能取得该账号的申请权。
+    await sendPrivateMessage(env, openId, "你的令牌申请正在处理或已有有效令牌，请勿重复点击。");
+    return;
   }
   try {
-    await sendPrivateMessage(env, openId, `你好，${name}。你的 Blender 更新令牌（有效期 90 天）是：\n${token}\n\n在 Blender 扩展仓库设置中填写 https://blender.3ddd.site/index.json，勾选“需要访问令牌”并粘贴此令牌。请勿转发或截图。`);
+    await createDownloadToken(env.EXTENSIONS, {
+      label: name, days: 90, token,
+      metadata: {
+        source: "feishu", applicantName: name, feishuOpenId: openId,
+        feishuTenantKey: event.header.tenant_key || null, feishuEventId: eventId,
+        requestChannel, requestedAt: claim.createdAt
+      }
+    });
+    const finalized = await env.EXTENSIONS.put(userKey, JSON.stringify({ ...claim, status: "issued" }), {
+      onlyIf: { etagMatches: claimed.etag }, httpMetadata: { contentType: "application/json" }
+    });
+    if (!finalized) throw new Error("feishu_token_claim_lost");
+    await deliverToken(env, openId, name, token);
   } catch (error) {
-    if (!existing) await env.EXTENSIONS.delete(key);
+    await env.EXTENSIONS.delete(key);
+    const current = await env.EXTENSIONS.get(userKey);
+    if (current && (await current.json()).eventId === eventId) {
+      await env.EXTENSIONS.put(userKey, JSON.stringify({ ...claim, status: "failed" }), {
+        onlyIf: { etagMatches: current.etag }, httpMetadata: { contentType: "application/json" }
+      });
+    }
     throw error;
   }
+}
+
+async function activeTokenRecord(bucket, hash) {
+  const object = await bucket.get(`${TOKEN_PREFIX}${hash}.json`);
+  if (!object) return false;
+  try {
+    const record = await object.json();
+    return !record.expiresAt || Date.parse(record.expiresAt) > Date.now();
+  } catch { return false; }
+}
+
+async function findActiveFeishuToken(bucket, openId) {
+  let cursor;
+  do {
+    const page = await bucket.list({ prefix: TOKEN_PREFIX, limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const object of page.objects) {
+      if (!/^auth\/tokens\/[a-f0-9]{64}\.json$/.test(object.key)) continue;
+      const stored = await bucket.get(object.key);
+      if (!stored) continue;
+      try {
+        const record = await stored.json();
+        if (record.source === "feishu" && record.feishuOpenId === openId &&
+            (!record.expiresAt || Date.parse(record.expiresAt) > Date.now())) {
+          return { ...record, hash: object.key.slice(TOKEN_PREFIX.length, -5) };
+        }
+      } catch { /* 损坏的记录不能作为有效令牌。 */ }
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return null;
+}
+
+async function deliverToken(env, openId, name, token) {
+  await sendPrivateMessage(env, openId, `你好，${name}。你的 Blender 更新令牌（有效期 90 天）是：\n${token}\n\n在 Blender 扩展仓库设置中填写 https://blender.3ddd.site/index.json，勾选“需要访问令牌”并粘贴此令牌。请勿转发或截图。`);
 }
 
 async function fulfillMenuRequest(env, event, openId) {
