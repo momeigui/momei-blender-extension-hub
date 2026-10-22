@@ -1,4 +1,5 @@
 import { escapeHtml, securityHeaders, page, homePage } from "./site.js";
+import { handleFeishuEvent } from "./feishu.js";
 
 const TOKEN_PREFIX = "auth/tokens/";
 const COOKIE_NAME = "momei_extensions_admin";
@@ -260,6 +261,7 @@ export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     try {
+      if (path === "/feishu/events") return await handleFeishuEvent(request, env);
       if (path === "/" && request.method === "GET") return homePage(await latestRelease(env.EXTENSIONS));
       if (path === "/admin" || path.startsWith("/admin/")) return await handleAdmin(request, env, path);
       return await handleDownload(request, env, path);

@@ -4,6 +4,20 @@
 
 公开首页 `/` 介绍 Noetix Motion Editor、安装方法和最新更新；它从私有 R2 的 `latest.json` 读取发布说明，不展示令牌或私有文件。Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌；文件内容从私有 R2 流式传出。`/admin` 是可视化管理页，可创建/撤销用户令牌、查看已发布文件；它不提供上传功能。管理员密钥只存为 Worker Secret，用户令牌只以 SHA-256 摘要存放在 R2。新令牌仅在创建时显示一次。
 
+## 飞书企业自建应用：第一阶段地址验证
+
+Worker 提供独立的 `POST /feishu/events` 回调入口。它按照飞书官方 SDK 的算法校验 `X-Lark-Signature`、时间戳与加密事件，再核对 Verification Token；地址验证成功时返回 `challenge`。主页 `/` **不是**回调地址。当前仅完成安全接入与地址验证，尚未启用聊天问答、员工自助领令牌、逐人私聊更新通知；普通消息明确返回 503，不会假装处理成功。请暂时不要订阅「接收消息」事件。
+
+配置顺序：
+
+1. 确认飞书应用是企业自建应用，已启用机器人能力。群自定义机器人 Webhook 无法用于此功能。
+2. 在飞书应用「事件与回调 → 加密策略」设置 Encrypt Key，查看 Verification Token；应用「凭证与基础信息」可查看 App ID。**不要把这些值发到聊天、提交到仓库或写进网页。**
+3. 在 Cloudflare Worker「设置 → Variables & Secrets」添加三个**运行时 Secret**：`FEISHU_APP_ID`、`FEISHU_VERIFY_TOKEN`、`FEISHU_ENCRYPT_KEY`，分别对应上述三个值。它们缺失时回调返回 503。
+4. 在飞书「事件与回调 → 事件配置」选择「将事件发送至开发者服务器」，请求地址填写 `https://momei-blender-extension-hub.amor.workers.dev/feishu/events`，再点击验证。不要在「回调配置」页设置长连接；本阶段不使用卡片按钮回调。
+5. 验证通过后**先不要订阅「接收消息」**。聊天、领令牌和逐人通知将在下一阶段接入、测试后启用。
+
+事件接收只支持飞书加密事件，拒绝未加密、错误签名、超过五分钟的请求。这样即使回调地址公开，也不能仅凭知道地址伪造员工消息。
+
 ## 推荐：独立 GitHub 仓库部署（本机不需要 npm）
 
 1. 在 Cloudflare 创建私有 R2 桶 `momei-blender-extension-files`，不要开启 `r2.dev` 公网访问。若使用其他桶名，先修改 `wrangler.jsonc` 的 `bucket_name`。
