@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "momei-blender-extension-hub",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-22",
+  "r2_buckets": [
+    {
+      "binding": "EXTENSIONS",
+      "bucket_name": "momei-blender-extension-files"
+    }
+  ]
+}
+
