@@ -158,6 +158,28 @@ test("管理页面有会话、来源和 CSRF 防护", async () => {
   assert.match(logout.headers.get("set-cookie"), /Max-Age=0/);
 });
 
+test("正常浏览器未发送 Origin 时仍能登录和提交，跨站来源继续被拒绝", async () => {
+  const env = fixture();
+  const loginForm = postForm({ secret: env.ADMIN_TOKEN });
+  delete loginForm.headers.Origin;
+  const loginResponse = await send(env, "/admin/login", loginForm);
+  assert.equal(loginResponse.status, 303);
+  const cookie = loginResponse.headers.get("set-cookie").split(";")[0];
+  const tokenForm = postForm({ csrf: await csrf(env, cookie), label: "无 Origin 浏览器", days: "30" }, cookie);
+  delete tokenForm.headers.Origin;
+  assert.equal((await send(env, "/admin/tokens", tokenForm)).status, 200);
+  const nullOrigin = postForm({ csrf: await csrf(env, cookie), label: "null Origin", days: "30" }, cookie);
+  nullOrigin.headers.Origin = "null";
+  assert.equal((await send(env, "/admin/tokens", nullOrigin)).status, 200);
+  const crossSite = postForm({ csrf: await csrf(env, cookie), label: "跨站", days: "30" }, cookie);
+  crossSite.headers.Origin = "https://attacker.example";
+  assert.equal((await send(env, "/admin/tokens", crossSite)).status, 403);
+  const badReferer = postForm({ csrf: await csrf(env, cookie), label: "跨站来源页", days: "30" }, cookie);
+  delete badReferer.headers.Origin;
+  badReferer.headers.Referer = "https://attacker.example/page";
+  assert.equal((await send(env, "/admin/tokens", badReferer)).status, 403);
+});
+
 test("到期的令牌拒绝下载", async () => {
   const env = fixture();
   const token = "nx_" + "a".repeat(43);
@@ -183,4 +205,6 @@ test("管理页转义用户备注，伪造会话无效", async () => {
   const response = await send(env, "/admin", { headers: { Cookie: forged } });
   assert.ok((await response.text()).includes("管理员登录"));
 });
+
+
 
