@@ -203,7 +203,38 @@ test("管理页转义用户备注，伪造会话无效", async () => {
   assert.ok(!html.includes("<script>alert(1)</script>"));
   const forged = cookie.replace(/.$/, cookie.endsWith("a") ? "b" : "a");
   const response = await send(env, "/admin", { headers: { Cookie: forged } });
-  assert.ok((await response.text()).includes("管理员登录"));
+  assert.ok((await response.text()).includes("欢迎回来"));
+});
+
+test("公开首页展示产品介绍和 R2 中最新版本说明，不暴露后台数据", async () => {
+  const env = fixture();
+  await env.EXTENSIONS.put("latest.json", JSON.stringify({
+    version: "0.1.45", date: "2026-10-21",
+    highlights: ["锁脚与锁手平滑过渡", "手部触地防内翻"]
+  }));
+  const response = await send(env, "/");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.ok(html.includes("Noetix Motion Editor"));
+  assert.ok(html.includes("v0.1.45"));
+  assert.ok(html.includes("锁脚与锁手平滑过渡"));
+  assert.ok(html.includes("/index.json"));
+  assert.ok(!html.includes(env.ADMIN_TOKEN));
+  assert.ok(!html.includes("auth/tokens"));
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+});
+
+test("首页对更新说明转义；元数据缺失时仍正常显示", async () => {
+  const env = fixture();
+  await env.EXTENSIONS.put("latest.json", JSON.stringify({
+    version: "0.1.46", date: "2026-10-22",
+    highlights: ["<script>alert(1)</script>"]
+  }));
+  const html = await (await send(env, "/")).text();
+  assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+  assert.ok(!html.includes("<script>alert(1)</script>"));
+  await env.EXTENSIONS.delete("latest.json");
+  assert.ok((await send(env, "/")).status === 200);
 });
 
 

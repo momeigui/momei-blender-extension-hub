@@ -2,7 +2,7 @@
 
 本仓库提供私有 R2 + Worker 的 Blender 更新通道。Noetix 的 GitHub 原更新通道保持不变；两边发布**同一个 ZIP**。用户只需在 Blender 中选择其中一条通道，不要同时安装两个来源的同一插件。以后新增插件时，只需把 ZIP 加入 Blender 生成的 `index.json`，Worker 会按索引放行，无需改文件名规则。
 
-Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌；文件内容从私有 R2 流式传出。`/admin` 是独立的可视化管理页，可创建/撤销用户令牌、查看已发布文件；它不提供上传功能。管理员密钥只存为 Worker Secret，用户令牌只以 SHA-256 摘要存放在 R2。新令牌仅在创建时显示一次。
+公开首页 `/` 介绍 Noetix Motion Editor、安装方法和最新更新；它从私有 R2 的 `latest.json` 读取发布说明，不展示令牌或私有文件。Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌；文件内容从私有 R2 流式传出。`/admin` 是可视化管理页，可创建/撤销用户令牌、查看已发布文件；它不提供上传功能。管理员密钥只存为 Worker Secret，用户令牌只以 SHA-256 摘要存放在 R2。新令牌仅在创建时显示一次。
 
 ## 推荐：独立 GitHub 仓库部署（本机不需要 npm）
 
@@ -19,7 +19,7 @@ Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌�
    | `CF_R2_ACCESS_KEY_ID` | R2 API 访问密钥 ID |
    | `CF_R2_SECRET_ACCESS_KEY` | R2 API 私密访问密钥 |
 
-6. 下一次推送含有 R2 发布步骤的新 `v*` 版本标签时，插件源码仓库的构建流程先发布 GitHub 通道，再将同一 ZIP 上传 R2，最后上传由 Blender 生成的 `index.json`。旧标签的工作流不会自动带上这次改动。首次发布前，管理页会显示“尚未上传”。
+6. 下一次推送含有 R2 发布步骤的新 `v*` 版本标签时，插件源码仓库的构建流程先发布 GitHub 通道，再将同一 ZIP 上传 R2、上传由 Blender 生成的 `index.json`，并根据 `CHANGELOG.md` 最新版本条目生成 `latest.json`。已有版本可手动运行源码仓库的 `Sync existing Extension release to R2` 工作流，不必重新编译。主页自动读取最新版本说明，无需修改 Worker 代码。
 
 ## 备选：本机 Wrangler 部署
 
@@ -41,7 +41,7 @@ Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌�
 
 ## 文件和权限边界
 
-- R2 根目录：`index.json` 与各插件的 `.zip` 包；只有被 `index.json` 的相对 `archive_url` 引用的 ZIP 才能下载。
+- R2 根目录：`index.json`、`latest.json` 与各插件的 `.zip` 包。`latest.json` 由 Worker 读取并渲染到公开首页，不直接作为下载端点；只有被 `index.json` 的相对 `archive_url` 引用的 ZIP 才能下载。
 - R2 私有前缀 `auth/tokens/`：用户令牌摘要与备注/有效期。Worker 不提供访问此路径的公开接口。
 - Worker Secret `ADMIN_TOKEN`：管理员登录与会话签名，不进入 R2/GitHub Actions。
 - GitHub Actions 的 R2 API 密钥：仅用于写入发布文件，不进入 Worker 或 Blender。
