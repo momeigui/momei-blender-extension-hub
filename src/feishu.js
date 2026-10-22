@@ -63,23 +63,33 @@ export async function handleFeishuEvent(request, env) {
   }
   const rawBody = await request.text();
   if (encoder.encode(rawBody).length > MAX_BODY_BYTES) return json({ error: "request_too_large" }, 413);
-  if (!await verifyRequest(request, rawBody, env.FEISHU_ENCRYPT_KEY)) {
-    return json({ error: "invalid_signature" }, 403);
-  }
-
+  let envelope;
   let event;
   try {
-    const envelope = JSON.parse(rawBody);
-    if (!envelope || typeof envelope.encrypt !== "string") throw new Error("unencrypted event");
-    event = await decryptEvent(envelope.encrypt, env.FEISHU_ENCRYPT_KEY);
+    envelope = JSON.parse(rawBody);
+    if (!envelope || typeof envelope !== "object") throw new Error("invalid event");
+    event = typeof envelope.encrypt === "string"
+      ? await decryptEvent(envelope.encrypt, env.FEISHU_ENCRYPT_KEY)
+      : envelope;
+    if (!event || typeof event !== "object") throw new Error("invalid event");
   } catch {
     return json({ error: "invalid_event" }, 400);
   }
+
+  const hasSignatureHeader = ["X-Lark-Request-Timestamp", "X-Lark-Request-Nonce", "X-Lark-Signature"]
+    .some(name => request.headers.has(name));
+  // 飞书首次验证地址的 challenge 可能没有普通事件的签名头。
+  // 仅允许 token 正确的 challenge 跳过验签；若带了签名头，仍必须验签。
+  const isChallenge = event.type === "url_verification" && typeof event.challenge === "string";
+  if ((!isChallenge || hasSignatureHeader) && !await verifyRequest(request, rawBody, env.FEISHU_ENCRYPT_KEY)) {
+    return json({ error: "invalid_signature" }, 403);
+  }
   const token = event.header?.token || event.token;
   if (token !== env.FEISHU_VERIFY_TOKEN) return json({ error: "invalid_token" }, 403);
-  if (event.type === "url_verification" && typeof event.challenge === "string") {
+  if (isChallenge) {
     return json({ challenge: event.challenge });
   }
+  if (typeof envelope.encrypt !== "string") return json({ error: "unencrypted_event" }, 403);
   if (event.header?.app_id !== env.FEISHU_APP_ID) return json({ error: "wrong_app" }, 403);
   // 消息处理尚未启用时，不能向飞书返回成功，否则员工消息会被静默丢弃。
   return json({ error: "message_handler_not_enabled" }, 503);

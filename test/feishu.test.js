@@ -23,14 +23,17 @@ async function signedEvent(event, options = {}) {
   const nonce = "test-nonce";
   const signatureBytes = await crypto.subtle.digest("SHA-256", encoder.encode(`${timestamp}${nonce}${env.FEISHU_ENCRYPT_KEY}${body}`));
   const signature = [...new Uint8Array(signatureBytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const headers = {
+    "Content-Type": "application/json"
+  };
+  if (!options.unsigned) Object.assign(headers, {
+    "X-Lark-Request-Timestamp": timestamp,
+    "X-Lark-Request-Nonce": nonce,
+    "X-Lark-Signature": options.signature || signature
+  });
   return new Request(`${origin}/feishu/events`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Lark-Request-Timestamp": timestamp,
-      "X-Lark-Request-Nonce": nonce,
-      "X-Lark-Signature": options.signature || signature
-    },
+    headers,
     body
   });
 }
@@ -41,6 +44,22 @@ test("飞书加密地址校验在验签和解密后返回 challenge", async () =
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { challenge: "test-challenge" });
   assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
+test("首次地址验证允许无签名的明文和加密 challenge，但必须核对 token", async () => {
+  const challenge = { type: "url_verification", token: env.FEISHU_VERIFY_TOKEN, challenge: "first-check" };
+  const plain = new Request(`${origin}/feishu/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(challenge)
+  });
+  const plainResponse = await worker.fetch(plain, env);
+  assert.equal(plainResponse.status, 200);
+  assert.deepEqual(await plainResponse.json(), { challenge: "first-check" });
+  const encryptedResponse = await worker.fetch(await signedEvent(challenge, { unsigned: true }), env);
+  assert.equal(encryptedResponse.status, 200);
+  assert.deepEqual(await encryptedResponse.json(), { challenge: "first-check" });
+  assert.equal((await worker.fetch(await signedEvent({ ...challenge, token: "wrong" }, { unsigned: true }), env)).status, 403);
 });
 
 test("飞书回调拒绝伪造签名、过期请求和错误 token", async () => {
@@ -55,5 +74,6 @@ test("未配置密钥和未接入的消息处理均明确拒绝", async () => {
   assert.equal((await worker.fetch(await signedEvent(challenge), {}, {})).status, 503);
   const message = { header: { token: env.FEISHU_VERIFY_TOKEN, app_id: env.FEISHU_APP_ID, event_type: "im.message.receive_v1" }, event: {} };
   assert.equal((await worker.fetch(await signedEvent(message), env)).status, 503);
+  assert.equal((await worker.fetch(await signedEvent(message, { unsigned: true }), env)).status, 403);
   assert.equal((await worker.fetch(new Request(`${origin}/feishu/events`), env)).status, 405);
 });
