@@ -1,3 +1,5 @@
+import { createDownloadToken, eventToken, tokenHash, TOKEN_PREFIX } from "./tokens.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_BODY_BYTES = 64 * 1024;
@@ -50,7 +52,70 @@ async function decryptEvent(encrypted, encryptKey) {
   return JSON.parse(text.slice(start, end + 1));
 }
 
-export async function handleFeishuEvent(request, env) {
+async function feishuAccessToken(env) {
+  const response = await fetch("https://accounts.feishu.cn/oauth/v3/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: env.FEISHU_APP_ID, client_secret: env.FEISHU_APP_SECRET })
+  });
+  const result = await response.json();
+  if (!response.ok || result.code !== 0 || typeof result.access_token !== "string") throw new Error(`feishu_auth_${result.code ?? response.status}`);
+  return result.access_token;
+}
+
+async function sendPrivateMessage(env, openId, text) {
+  const accessToken = await feishuAccessToken(env);
+  const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ receive_id: openId, msg_type: "text", content: JSON.stringify({ text }) })
+  });
+  const result = await response.json();
+  if (!response.ok || result.code !== 0) throw new Error(`feishu_message_${result.code ?? response.status}`);
+}
+
+function requestName(message) {
+  if (message?.message_type !== "text" || typeof message.content !== "string") return null;
+  let content;
+  try { content = JSON.parse(message.content).text?.trim(); } catch { return null; }
+  if (typeof content !== "string") return null;
+  const match = /^(?:领取令牌|申请令牌|令牌)\s+(.+)$/u.exec(content);
+  if (!match) return null;
+  const name = match[1].trim();
+  return name.length >= 2 && name.length <= 40 && !/[\x00-\x1f<>]/u.test(name) ? name : null;
+}
+
+async function fulfillTokenRequest(env, event, name) {
+  const openId = event.event.sender.sender_id.open_id;
+  const eventId = event.header.event_id;
+  const token = await eventToken(env.ADMIN_TOKEN, env.FEISHU_APP_ID, eventId);
+  const hash = await tokenHash(token);
+  const key = `${TOKEN_PREFIX}${hash}.json`;
+  const existing = await env.EXTENSIONS.get(key);
+  if (!existing) {
+    await createDownloadToken(env.EXTENSIONS, {
+      label: name,
+      days: 90,
+      token,
+      metadata: {
+        source: "feishu",
+        applicantName: name,
+        feishuOpenId: openId,
+        feishuTenantKey: event.header.tenant_key || null,
+        feishuEventId: eventId,
+        requestedAt: new Date().toISOString()
+      }
+    });
+  }
+  try {
+    await sendPrivateMessage(env, openId, `你好，${name}。你的 Blender 更新令牌（有效期 90 天）是：\n${token}\n\n在 Blender 扩展仓库设置中填写 https://blender.3ddd.site/index.json，勾选“需要访问令牌”并粘贴此令牌。请勿转发或截图。`);
+  } catch (error) {
+    if (!existing) await env.EXTENSIONS.delete(key);
+    throw error;
+  }
+}
+
+export async function handleFeishuEvent(request, env, ctx) {
   if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
   if (!env.FEISHU_APP_ID || !env.FEISHU_VERIFY_TOKEN || !env.FEISHU_ENCRYPT_KEY) {
     return json({ error: "feishu_not_configured" }, 503);
@@ -91,6 +156,26 @@ export async function handleFeishuEvent(request, env) {
   }
   if (typeof envelope.encrypt !== "string") return json({ error: "unencrypted_event" }, 403);
   if (event.header?.app_id !== env.FEISHU_APP_ID) return json({ error: "wrong_app" }, 403);
-  // 消息处理尚未启用时，不能向飞书返回成功，否则员工消息会被静默丢弃。
-  return json({ error: "message_handler_not_enabled" }, 503);
+  // 此阶段只接管员工单聊里的领令牌命令；其它现有订阅事件不得被静默确认。
+  if (event.header?.event_type !== "im.message.receive_v1") return json({ error: "event_not_handled" }, 503);
+  if (event.event?.message?.chat_type !== "p2p" || event.event?.sender?.sender_type !== "user") {
+    return json({ error: "private_user_message_required" }, 403);
+  }
+  const openId = event.event?.sender?.sender_id?.open_id;
+  if (typeof openId !== "string" || !/^ou_[A-Za-z0-9_-]{5,128}$/.test(openId) ||
+      typeof event.header?.event_id !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(event.header.event_id)) {
+    return json({ error: "invalid_sender_or_event" }, 400);
+  }
+  if (!env.FEISHU_APP_SECRET || !env.ADMIN_TOKEN || !env.EXTENSIONS || !ctx?.waitUntil) {
+    return json({ error: "token_issuance_not_configured" }, 503);
+  }
+  const name = requestName(event.event.message);
+  if (!name) {
+    ctx.waitUntil(sendPrivateMessage(env, openId, "领更新令牌请发送：领取令牌 你的姓名。令牌只会私聊发给你本人。")
+      .catch(error => console.error("Feishu instruction delivery failed", error.message)));
+    return json({ code: 0 });
+  }
+  ctx.waitUntil(fulfillTokenRequest(env, event, name)
+    .catch(error => console.error("Feishu token delivery failed", error.message)));
+  return json({ code: 0 });
 }

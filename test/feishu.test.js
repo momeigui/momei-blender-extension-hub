@@ -69,11 +69,97 @@ test("飞书回调拒绝伪造签名、过期请求和错误 token", async () =>
   assert.equal((await worker.fetch(await signedEvent({ ...challenge, token: "wrong" }), env)).status, 403);
 });
 
-test("未配置密钥和未接入的消息处理均明确拒绝", async () => {
+test("未配置密钥或令牌下发条件不足时明确拒绝", async () => {
   const challenge = { type: "url_verification", token: env.FEISHU_VERIFY_TOKEN, challenge: "abc" };
   assert.equal((await worker.fetch(await signedEvent(challenge), {}, {})).status, 503);
-  const message = { header: { token: env.FEISHU_VERIFY_TOKEN, app_id: env.FEISHU_APP_ID, event_type: "im.message.receive_v1" }, event: {} };
+  const message = messageEvent();
   assert.equal((await worker.fetch(await signedEvent(message), env)).status, 503);
   assert.equal((await worker.fetch(await signedEvent(message, { unsigned: true }), env)).status, 403);
   assert.equal((await worker.fetch(new Request(`${origin}/feishu/events`), env)).status, 405);
+});
+
+class MemoryBucket {
+  constructor() { this.items = new Map(); }
+  async get(key) {
+    const value = this.items.get(key);
+    return value ? { json: async () => JSON.parse(value) } : null;
+  }
+  async put(key, value) { this.items.set(key, value); }
+  async delete(key) { this.items.delete(key); }
+}
+
+function messageEvent({ eventId = "event_12345678", chatType = "p2p", text = "领取令牌 张三", senderType = "user" } = {}) {
+  return {
+    schema: "2.0",
+    header: { token: env.FEISHU_VERIFY_TOKEN, app_id: env.FEISHU_APP_ID, tenant_key: "tenant_test", event_id: eventId, event_type: "im.message.receive_v1" },
+    event: {
+      sender: { sender_type: senderType, sender_id: { open_id: "ou_employee12345" } },
+      message: { chat_type: chatType, message_type: "text", content: JSON.stringify({ text }) }
+    }
+  };
+}
+
+function tokenEnv() {
+  return { ...env, ADMIN_TOKEN: "admin-secret-for-token-derivation", FEISHU_APP_SECRET: "feishu-app-secret", EXTENSIONS: new MemoryBucket() };
+}
+
+async function runEvent(event, configuredEnv) {
+  const pending = [];
+  const response = await worker.fetch(await signedEvent(event), configuredEnv, { waitUntil: promise => pending.push(promise) });
+  await Promise.all(pending);
+  return response;
+}
+
+test("员工私聊领令牌：记录申请人、飞书身份及申请时间，令牌只出现在私信", async () => {
+  const configuredEnv = tokenEnv();
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), body: JSON.parse(options.body) });
+    return Response.json(url.includes("/oauth/") ? { code: 0, access_token: "feishu-access-token" } : { code: 0 });
+  };
+  try {
+    const response = await runEvent(messageEvent(), configuredEnv);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { code: 0 });
+    const [[key, rawRecord]] = [...configuredEnv.EXTENSIONS.items];
+    assert.match(key, /^auth\/tokens\/[a-f0-9]{64}\.json$/);
+    const record = JSON.parse(rawRecord);
+    assert.equal(record.label, "张三");
+    assert.equal(record.applicantName, "张三");
+    assert.equal(record.feishuOpenId, "ou_employee12345");
+    assert.equal(record.feishuTenantKey, "tenant_test");
+    assert.equal(record.source, "feishu");
+    assert.ok(Date.parse(record.requestedAt));
+    assert.ok(Date.parse(record.expiresAt) > Date.now());
+    const sent = calls.find(call => call.url.includes("/im/v1/messages"));
+    assert.equal(sent.body.receive_id, "ou_employee12345");
+    assert.match(JSON.parse(sent.body.content).text, /nx_[A-Za-z0-9_-]{40,100}/);
+    assert.ok(!rawRecord.includes("nx_"));
+    assert.equal((await worker.fetch(await signedEvent(messageEvent({ chatType: "group" })), configuredEnv)).status, 403);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("飞书事件重试复用同一令牌；发送失败不留下未交付的新令牌", async () => {
+  const configuredEnv = tokenEnv();
+  const issued = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("/oauth/")) return Response.json({ code: 0, access_token: "access" });
+    issued.push(JSON.parse(JSON.parse(options.body).content).text.match(/nx_[A-Za-z0-9_-]+/)?.[0]);
+    return Response.json({ code: 0 });
+  };
+  try {
+    await runEvent(messageEvent(), configuredEnv);
+    await runEvent(messageEvent(), configuredEnv);
+    assert.equal(issued[0], issued[1]);
+    assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+    globalThis.fetch = async url => Response.json(String(url).includes("/oauth/") ? { code: 0, access_token: "access" } : { code: 123 });
+    await runEvent(messageEvent({ eventId: "event_87654321" }), configuredEnv);
+    assert.equal(configuredEnv.EXTENSIONS.items.size, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
