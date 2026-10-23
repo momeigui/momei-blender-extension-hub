@@ -1,8 +1,16 @@
 # Momei Blender 扩展更新通道
 
-本仓库提供私有 R2 + Worker 的 Blender 更新通道。Noetix 的 GitHub 原更新通道保持不变；两边发布**同一个 ZIP**。用户只需在 Blender 中选择其中一条通道，不要同时安装两个来源的同一插件。以后新增插件时，只需把 ZIP 加入 Blender 生成的 `index.json`，Worker 会按索引放行，无需改文件名规则。
+本仓库提供带令牌鉴权的 Blender 更新通道。默认由私有 R2 + Worker 提供文件；配置阿里云国内网关后，Worker 保留原有仓库地址及令牌验证，短跳转至北京函数计算，由函数计算从私有 OSS 挂载目录传输安装包。R2 留作网关健康检查失败时的备份。Noetix 的 GitHub 原更新通道保持不变；各处发布**同一个 ZIP**。用户只需在 Blender 中选择其中一条仓库通道，不要同时安装两个来源的同一插件。
 
-公开首页 `/` 介绍 Noetix Motion Editor、安装方法和最新更新；它从私有 R2 的 `latest.json` 读取发布说明，不展示令牌或私有文件。Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌；文件内容从私有 R2 流式传出。`/admin` 是可视化管理页，可创建/撤销用户令牌、查看已发布文件；它不提供上传功能。管理员密钥只存为 Worker Secret，用户令牌只以 SHA-256 摘要存放在 R2。新令牌仅在创建时显示一次。
+公开首页 `/` 介绍 Noetix Motion Editor、安装方法和最新更新；它从私有 R2 的 `latest.json` 读取发布说明，不展示令牌或私有文件。Worker 对 `index.json` 和安装 ZIP 都验证 Blender 发送的 Bearer 令牌；国内网关还会向 Worker 的 `/auth/check` 复核令牌，再从 OSS 传输文件。`/admin` 是可视化管理页，可创建/撤销用户令牌、查看 R2 备份文件；它不提供上传功能。管理员密钥只存为 Worker Secret，用户令牌只以 SHA-256 摘要存放在 R2。新令牌仅在创建时显示一次。
+
+## 阿里云国内下载网关
+
+国内网关代码在 [`aliyun-gateway/`](aliyun-gateway/)，具体部署步骤见其 [README](aliyun-gateway/README.md)。需要在华北 2（北京）创建函数计算 Web 函数，将私有 OSS Bucket `momei-blender-extension` **只读挂载**到 `/mnt/oss`；网关无需 OSS AccessKey。函数计算要允许公网 HTTP 触发，但服务代码对每个索引/ZIP 请求都会向 Worker 复核 Bearer 令牌，并检查 ZIP 是否列在 OSS 的 `index.json` 中。`/health` 只检查挂载中的索引与安装包是否完整、能否联系 Worker 鉴权服务，不提供文件。
+
+先部署网关并验证 `/health` 返回 200、无令牌访问 `/index.json` 返回 401、有效令牌访问索引和 ZIP 成功；然后在 Cloudflare Worker 的运行时变量中设置 `ALIYUN_GATEWAY_BASE_URL` 为网关的 **HTTPS 根地址**（不含 `/index.json`）。Worker 更新代码部署后才会使用该变量。未设置变量或网关健康检查失败时，继续由 R2 提供文件，不会把用户转到故障网关。现有 Blender 仓库 URL `https://blender.3ddd.site/index.json` 与用户令牌均不变。
+
+不能把 Worker 直接跳转到 OSS 签名 URL：Blender 的下载实现会把 Bearer 令牌继续带到跨域重定向目标，OSS 会拒绝同时存在签名 URL 和 `Authorization` 请求头。国内网关能接收 Bearer 并在国内传输文件，从而避免大安装包继续经过 Cloudflare。函数计算、OSS 读请求及网络流量可能产生费用。
 
 ## 飞书企业自建应用：员工自助领令牌
 

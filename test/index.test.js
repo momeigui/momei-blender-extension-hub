@@ -135,10 +135,12 @@ test("网页只保存令牌摘要；撤销后立即拒绝下载", async () => {
   assert.match(tokenKey, /^auth\/tokens\/[a-f0-9]{64}\.json$/);
   assert.equal(JSON.stringify([...env.EXTENSIONS.items]).includes(token), false);
   assert.equal((await send(env, "/index.json", { headers: { Authorization: `Bearer ${token}` } })).status, 200);
+  assert.equal((await send(env, "/auth/check", { headers: { Authorization: `Bearer ${token}` } })).status, 204);
   const hash = tokenKey.slice("auth/tokens/".length, -5);
   const response = await send(env, "/admin/tokens/revoke", postForm({ csrf: await csrf(env, cookie), hash }, cookie));
   assert.equal(response.status, 200);
   assert.equal((await send(env, "/index.json", { headers: { Authorization: `Bearer ${token}` } })).status, 401);
+  assert.equal((await send(env, "/auth/check", { headers: { Authorization: `Bearer ${token}` } })).status, 401);
 });
 
 test("管理页面有会话、来源和 CSRF 防护", async () => {
@@ -257,6 +259,55 @@ test("首页对更新说明转义；元数据缺失时仍正常显示", async ()
   assert.ok(!html.includes("<script>alert(1)</script>"));
   await env.EXTENSIONS.delete("latest.json");
   assert.ok((await send(env, "/")).status === 200);
+});
+
+test("阿里云国内网关就绪时保留原地址和令牌，跳转到能接收 Bearer 的网关", async () => {
+  const env = { ...fixture(), ALIYUN_GATEWAY_BASE_URL: "https://gateway.example.test" };
+  await env.EXTENSIONS.put("index.json", JSON.stringify({ data: [{ archive_url: `./${zip}` }] }));
+  await env.EXTENSIONS.put(zip, "R2_BACKUP");
+  const token = await createToken(env, await login(env));
+  const auth = { Authorization: `Bearer ${token}` };
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async url => { requests.push(url); return new Response("ok"); };
+  try {
+    assert.equal((await send(env, "/index.json")).status, 401);
+    assert.equal(requests.length, 0);
+    assert.equal((await send(env, "/auth/check")).status, 401);
+    assert.equal((await send(env, "/auth/check", { headers: auth })).status, 204);
+    const index = await send(env, "/index.json", { headers: auth });
+    assert.equal(index.status, 307);
+    assert.equal(index.headers.get("Location"), "https://gateway.example.test/index.json");
+    const download = await send(env, `/${zip}`, { headers: auth });
+    assert.equal(download.status, 307);
+    assert.equal(download.headers.get("Location"), `https://gateway.example.test/${zip}`);
+    assert.equal(download.headers.get("cache-control"), "private, no-store");
+    const head = await send(env, `/${zip}`, { method: "HEAD", headers: auth });
+    assert.equal(head.status, 307);
+    assert.equal((await send(env, "/not-listed.zip", { headers: auth })).status, 307);
+    assert.ok(requests.every(url => url === "https://gateway.example.test/health"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("阿里云国内网关不可用时 R2 更新通道继续可用", async () => {
+  const env = { ...fixture(), ALIYUN_GATEWAY_BASE_URL: "https://gateway.example.test" };
+  await env.EXTENSIONS.put("index.json", JSON.stringify({ data: [{ archive_url: `./${zip}` }] }));
+  await env.EXTENSIONS.put(zip, "R2_BACKUP");
+  const token = await createToken(env, await login(env));
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  globalThis.fetch = async () => { throw new Error("simulated OSS outage"); };
+  console.warn = () => {};
+  try {
+    const response = await send(env, `/${zip}`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "R2_BACKUP");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
 });
 
 

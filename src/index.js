@@ -9,6 +9,26 @@ const SESSION_SECONDS = 3600;
 const ZIP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.zip$/;
 const encoder = new TextEncoder();
 
+function gatewayBase(env) {
+  const value = env.ALIYUN_GATEWAY_BASE_URL?.trim();
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return null;
+    return url.href.replace(/\/$/, "");
+  } catch { return null; }
+}
+
+async function gatewayReady(base) {
+  try {
+    const response = await fetch(`${base}/health`, { redirect: "manual", signal: AbortSignal.timeout(4000) });
+    return response.status === 200;
+  } catch (error) {
+    console.warn("Aliyun gateway unavailable; using R2 backup", error);
+    return false;
+  }
+}
+
 function hex(bytes) {
   return [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -139,6 +159,7 @@ async function latestRelease(bucket) {
 
 async function dashboard(env, payload, notice = "", createdToken = "") {
   const csrf = await csrfToken(env.ADMIN_TOKEN, payload);
+  const delivery = gatewayBase(env) ? "阿里云国内网关下载，R2 备用" : "R2 下载（阿里云网关未启用）";
   const [tokens, files, index] = await Promise.all([
     tokensForDashboard(env.EXTENSIONS, env.FEISHU_APP_ID), releaseFiles(env.EXTENSIONS), env.EXTENSIONS.head("index.json")
   ]);
@@ -149,12 +170,12 @@ async function dashboard(env, payload, notice = "", createdToken = "") {
     return `<tr><td>${escapeHtml(token.label || "（未命名）")}</td><td>${token.source === "feishu" ? `飞书私聊<br><small>${escapeHtml(token.feishuOpenId || "")}</small>` : "后台创建"}</td><td><span class="status ${active ? "" : "status-expired"}">${active ? "有效" : "已过期"}</span></td><td>${token.subscribed === null ? "—" : `<span class="status ${token.subscribed ? "" : "status-expired"}">${token.subscribed ? "已订阅" : "已取消"}</span>`}</td><td>${escapeHtml(formatTime(token.requestedAt || token.createdAt))}</td><td>${token.expiresAt ? escapeHtml(formatTime(token.expiresAt)) : "永不过期"}</td><td><form class="inline" action="/admin/tokens/revoke" method="post"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="hash" value="${escapeHtml(token.hash)}"><button class="small-button" type="submit" aria-label="撤销 ${escapeHtml(token.label || "未命名")} 的令牌">撤销</button></form></td></tr>`;
   }).join("");
   const fileRows = files.map(file => `<tr><td><code>${escapeHtml(file.key)}</code></td><td>${formatSize(file.size)}</td><td>${escapeHtml(formatTime(file.uploaded))}</td></tr>`).join("");
-  const body = `<div class="container admin-shell"><div class="admin-intro"><div><span class="section-kicker">DISTRIBUTION CONSOLE</span><h1>扩展更新管理</h1><p>管理下载权限，查看已经发布到私有 R2 的文件。</p></div><form class="logout-form" action="/admin/logout" method="post"><input type="hidden" name="csrf" value="${csrf}"><button class="btn btn-light" type="submit">退出登录</button></form></div>
+  const body = `<div class="container admin-shell"><div class="admin-intro"><div><span class="section-kicker">DISTRIBUTION CONSOLE</span><h1>扩展更新管理</h1><p>管理下载权限，查看发布文件。当前下载路径：${delivery}。</p></div><form class="logout-form" action="/admin/logout" method="post"><input type="hidden" name="csrf" value="${csrf}"><button class="btn btn-light" type="submit">退出登录</button></form></div>
   ${notice ? `<div class="notice notice-success" role="status">${escapeHtml(notice)}</div>` : ""}
   ${createdToken ? `<div class="token-once" role="status"><h2>新令牌已创建 · 仅显示一次</h2><p>请现在复制并安全地交给对应用户。服务器只保存摘要，之后无法找回原文。</p><code>${escapeHtml(createdToken)}</code></div>` : ""}
-  <div class="metric-grid"><div class="metric"><span class="metric-label">仓库索引</span><strong>${index ? '<span class="status">已就绪</span>' : '<span class="status status-missing">未上传</span>'}</strong><small>${index ? formatSize(index.size) : "等待构建发布"}</small></div><div class="metric"><span class="metric-label">发布安装包</span><strong>${files.length}</strong><small>私有 R2 存储桶</small></div><div class="metric"><span class="metric-label">有效下载令牌</span><strong>${activeCount}</strong><small>共 ${tokens.length} 个令牌记录</small></div></div>
+  <div class="metric-grid"><div class="metric"><span class="metric-label">R2 备份索引</span><strong>${index ? '<span class="status">已就绪</span>' : '<span class="status status-missing">未上传</span>'}</strong><small>${index ? formatSize(index.size) : "等待构建发布"}</small></div><div class="metric"><span class="metric-label">R2 备份安装包</span><strong>${files.length}</strong><small>${delivery}</small></div><div class="metric"><span class="metric-label">有效下载令牌</span><strong>${activeCount}</strong><small>共 ${tokens.length} 个令牌记录</small></div></div>
   <div class="admin-grid"><section class="panel"><h2>创建下载令牌</h2><p class="panel-subtitle">为用户单独发放，可随时撤销。</p><form action="/admin/tokens" method="post"><input type="hidden" name="csrf" value="${csrf}"><label class="field"><span>备注名称</span><input type="text" name="label" maxlength="80" placeholder="例如：测试用户 / 团队成员" required></label><label class="field"><span>有效期</span><select name="days"><option value="90">90 天</option><option value="30">30 天</option><option value="365">365 天</option><option value="0">永不过期</option></select></label><div class="form-actions"><button class="btn btn-blue" type="submit">创建令牌</button></div></form></section><section class="panel"><h2>用户令牌</h2><p class="panel-subtitle">飞书令牌持有人默认订阅；只有有效令牌且仍订阅者才会收到更新提醒。</p><div class="table-scroll"><table class="data-table token-table"><thead><tr><th>申请人</th><th>来源／飞书 ID</th><th>令牌状态</th><th>更新提醒</th><th>申请时间</th><th>到期时间</th><th>操作</th></tr></thead><tbody>${tokenRows || '<tr><td class="empty-cell" colspan="7">暂无令牌。可在左侧创建第一个下载令牌。</td></tr>'}</tbody></table></div></section></div>
-  <section class="panel panel-wide"><div class="panel-head"><div><h2>发布文件</h2><p class="panel-subtitle">由 GitHub 构建流程推送，本页仅供查看。</p></div><span class="status ${index ? "" : "status-missing"}">index.json ${index ? "已存在" : "尚未上传"}</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>ZIP 安装包</th><th>大小</th><th>上传时间</th></tr></thead><tbody>${fileRows || '<tr><td class="empty-cell" colspan="3">暂无发布包</td></tr>'}</tbody></table></div><p class="helper">同一个安装包同时发布到 GitHub 与 Cloudflare 通道；用户只需选择其中一条更新源。</p></section></div>`;
+  <section class="panel panel-wide"><div class="panel-head"><div><h2>R2 备份文件</h2><p class="panel-subtitle">由 GitHub 构建流程推送，本页仅显示 R2 备份内容。</p></div><span class="status ${index ? "" : "status-missing"}">index.json ${index ? "已存在" : "尚未上传"}</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>ZIP 安装包</th><th>大小</th><th>上传时间</th></tr></thead><tbody>${fileRows || '<tr><td class="empty-cell" colspan="3">暂无发布包</td></tr>'}</tbody></table></div><p class="helper">用户继续使用原有 Blender 仓库地址和令牌；网关就绪后，索引和安装包从阿里云国内节点传输。</p></section></div>`;
   return page("管理", body, 200, {}, "admin");
 }
 
@@ -216,15 +237,17 @@ async function listedArchive(bucket, name) {
   const index = await bucket.get("index.json");
   if (!index) return false;
   try {
-    const repository = await index.json();
-    return Array.isArray(repository.data) && repository.data.some(item => {
-      const url = item?.archive_url;
-      if (typeof url !== "string" || !url.startsWith("./")) return false;
-      try {
-        return decodeURIComponent(url.slice(2)) === name;
-      } catch { return false; }
-    });
+    return archiveListedInIndex(await index.json(), name);
   } catch { return false; }
+}
+
+function archiveListedInIndex(repository, name) {
+  return Array.isArray(repository?.data) && repository.data.some(item => {
+    const url = item?.archive_url;
+    if (typeof url !== "string" || !url.startsWith("./")) return false;
+    try { return decodeURIComponent(url.slice(2)) === name; }
+    catch { return false; }
+  });
 }
 
 async function handleDownload(request, env, path) {
@@ -234,6 +257,10 @@ async function handleDownload(request, env, path) {
   if (!env.EXTENSIONS) return new Response("Storage unavailable", { status: 503, headers: securityHeaders() });
   if (!await validDownloadToken(env.EXTENSIONS, request)) {
     return new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": 'Bearer realm="Momei Blender Extensions"', ...securityHeaders() } });
+  }
+  const gateway = gatewayBase(env);
+  if (gateway && await gatewayReady(gateway)) {
+    return new Response(null, { status: 307, headers: { Location: `${gateway}/${name}`, ...securityHeaders() } });
   }
   if (name !== "index.json" && !await listedArchive(env.EXTENSIONS, name)) {
     return new Response("Not found", { status: 404, headers: securityHeaders() });
@@ -257,6 +284,9 @@ export default {
       if (path === "/feishu/events") return await handleFeishuEvent(request, env, ctx);
       if (path === "/" && request.method === "GET") return homePage(await latestRelease(env.EXTENSIONS));
       if (path === "/admin" || path.startsWith("/admin/")) return await handleAdmin(request, env, path);
+      if (path === "/auth/check" && request.method === "GET") {
+        return new Response(null, { status: env.EXTENSIONS && await validDownloadToken(env.EXTENSIONS, request) ? 204 : 401, headers: securityHeaders() });
+      }
       return await handleDownload(request, env, path);
     } catch (error) {
       console.error("Extension gateway request failed", error);
